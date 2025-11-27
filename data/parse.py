@@ -1,186 +1,242 @@
 import pandas as pd
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
-import matplotlib.pyplot as plt
+from rdkit import Chem
+from tqdm import tqdm
 
-# models.py から必要なクラスをインポート
-from models import build_model, ModelConfig
+# --- 設定パラメータ ---
+INPUT_SDF = "data/raw/MoNA.sdf"       # 入力ファイルパス
+OUTPUT_PARQUET = "data/processed/MoNA.parquet" # 出力ファイルパス
 
-# --- 設定 ---
-PARQUET_FILE = "data/processed/MoNA.parquet"
-BATCH_SIZE = 64
-LR = 5e-4
-EPOCHS = 50
+MAX_MZ = 2000                      # m/z範囲 (0〜2000)
+SANITIZE = True                    # Strictモード (RDKitで構造エラーなら捨てる)
+FILTER_EI = True                   # EI関連のキーワードが含まれるかチェックするか
 
-# --- 1. Datasetクラス (変更なし) ---
-class MassSpecDataset(Dataset):
-    def __init__(self, dataframe, mode='train'):
-        self.df = dataframe.reset_index(drop=True)
-        self.mode = mode
+# --- 官能基定義 (SMARTS) ---
+SMARTS_PATTERNS = {
+    'has_ether':      '[OD2]([#6])[#6]',
+    'has_carbonyl':   '[CX3]=[OX1]',
+    'has_alcohol':    '[#6][OX2H]',
+    'has_amine':      '[NX3;!$(NC=O)]',
+    'has_cyano':      '[NX1]#[CX2]',
+    'has_amide':      '[NX3][CX3](=[OX1])',
+    'has_carboxylic': '[CX3](=O)[OX2H1]',
+}
+MOL_PATTERNS = {k: Chem.MolFromSmarts(v) for k, v in SMARTS_PATTERNS.items()}
 
-        first_spec = self.df.iloc[0]['spectrum']
-        self.spec_len = len(first_spec)
+def parse_spectrum(spec_str, max_mz=2000):
+    """
+    スペクトル文字列をパースし、(正規化配列, ピーク数, 総強度) を返す
+    """
+    if not spec_str:
+        return None, 0, 0.0
 
-        print(f"[{mode}] Loaded {len(self.df)} spectra.")
-        if mode == 'train': # ログがうるさくならないようにtrain時のみ表示
-            print(f"   - Feature: spectrum length = {self.spec_len}")
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        spectrum = row['spectrum'].astype(np.float32)
-        nonzero_indices = np.nonzero(spectrum)[0]
-        approx_mw = float(nonzero_indices.max()) if len(nonzero_indices) > 0 else 0.0
-
-        return {
-            'features': torch.tensor(spectrum, dtype=torch.float32),
-            'mw': torch.tensor([approx_mw], dtype=torch.float32),
-            'spectrum': torch.tensor(spectrum, dtype=torch.float32)
-        }
-
-# --- 2. 損失関数 (変更なし) ---
-class CosineLoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.cosine = nn.CosineSimilarity(dim=1, eps=1e-8)
-
-    def forward(self, y_pred, y_true):
-        score = self.cosine(y_pred, y_true)
-        return torch.mean(1.0 - score)
-
-# --- 3. 学習ループ (修正版) ---
-def run_training():
-    print("Loading data...")
-    df = pd.read_parquet(PARQUET_FILE)
+    spectrum = np.zeros(max_mz + 1, dtype=np.float32)
+    lines = spec_str.strip().split('\n')
     
-    # 【修正1】データの3分割 (Train: 80%, Val: 10%, Test: 10%)
-    # まず全体からTest(10%)を切り出す
-    train_val_df, test_df = train_test_split(df, test_size=0.1, random_state=42)
-    # 残りのTrain+ValからVal(元の全体の10%になるよう、約11%を指定)を切り出す
-    train_df, val_df = train_test_split(train_val_df, test_size=0.1111, random_state=42)
-    
-    # Dataset作成
-    train_dataset = MassSpecDataset(train_df, mode='train')
-    val_dataset = MassSpecDataset(val_df, mode='val')
-    test_dataset = MassSpecDataset(test_df, mode='test') # 【修正2】Test Dataset追加
-    
-    # DataLoader作成
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False) # 【修正2】Test Loader追加
-    
-    # --- Model Config設定 ---
-    total_input_dim = train_dataset.spec_len
-    
-    config = ModelConfig(
-        fp_length=total_input_dim,
-        max_mass_spec_peak_loc=train_dataset.spec_len,
-        hidden_units=2000,
-        num_hidden_layers=3,
-        dropout_rate=0.2,
-        bidirectional_prediction=True,
-        gate_bidirectional_predictions=True,
-        device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    )
-    
-    print(f"Initializing model on {config.device}...")
-    model = build_model("mlp", config=config)
-    model.to(config.device)
-    
-    optimizer = optim.Adam(model.parameters(), lr=LR)
-    criterion = CosineLoss()
-    
-    history = {'train_loss': [], 'val_loss': []}
-    
-    print("\nStart Training ...")
-    
-    for epoch in range(EPOCHS):
-        model.train()
-        train_loss = 0
-        
-        for batch in train_loader:
-            features = batch['features'].to(config.device)
-            mw = batch['mw'].to(config.device)
-            target = batch['spectrum'].to(config.device)
+    peak_count = 0
+    total_intensity = 0.0
+    max_intensity = 0.0
+
+    try:
+        for line in lines:
+            line = line.strip()
+            if not line: continue
             
-            optimizer.zero_grad()
-            prediction, _ = model(features, mw)
-            loss = criterion(prediction, target)
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item()
+            parts = line.split()
+            if len(parts) < 2: continue
             
-        avg_train_loss = train_loss / len(train_loader)
-        
-        # Validation
-        model.eval()
-        val_loss = 0
-        with torch.no_grad():
-            for batch in val_loader:
-                features = batch['features'].to(config.device)
-                mw = batch['mw'].to(config.device)
-                target = batch['spectrum'].to(config.device)
-                prediction, _ = model(features, mw)
-                loss = criterion(prediction, target)
-                val_loss += loss.item()
-        
-        avg_val_loss = val_loss / len(val_loader)
-        
-        history['train_loss'].append(avg_train_loss)
-        history['val_loss'].append(avg_val_loss)
-        
-        print(f"Epoch {epoch+1}/{EPOCHS} | "
-              f"Train Sim: {1-avg_train_loss:.4f} | "
-              f"Val Sim: {1-avg_val_loss:.4f}")
-
-    # モデル保存
-    save_path = "mass_spec_model.pth"
-    torch.save(model.state_dict(), save_path)
-    print(f"Model saved to {save_path}")
-
-    # 学習曲線の表示
-    plt.plot(history['train_loss'], label='Train Loss')
-    plt.plot(history['val_loss'], label='Val Loss')
-    plt.title('Training Loss (1 - Cosine Similarity)')
-    plt.xlabel('Epoch')
-    plt.legend()
-    plt.show()
-
-    # --- 【修正3】Testデータでの最終評価 ---
-    print("\n--- Final Evaluation on Test Set ---")
-    
-    # (オプション) 学習後のモデル状態を確実にロードする場合
-    # model.load_state_dict(torch.load(save_path))
-    
-    model.eval()
-    test_loss = 0
-    test_sim_accum = 0 # サンプルごとの厳密な平均を出したい場合用
-    
-    with torch.no_grad():
-        for batch in test_loader:
-            features = batch['features'].to(config.device)
-            mw = batch['mw'].to(config.device)
-            target = batch['spectrum'].to(config.device)
+            mz = float(parts[0])
+            intensity = float(parts[1])
             
-            prediction, _ = model(features, mw)
-            loss = criterion(prediction, target)
-            test_loss += loss.item()
+            if mz > max_mz or mz < 0:
+                continue
             
-            # バッチ平均ではなく、より直感的な類似度を表示用
-            # CosineLossは平均(1-sim)を返しているので、ここでの Sim = 1 - Loss
+            idx = int(round(mz))
+            
+            # Max Pooling & Stats accumulation
+            if intensity > spectrum[idx]:
+                spectrum[idx] = intensity
+            
+            # 統計用には生データを加算
+            total_intensity += intensity
+            peak_count += 1
+            
+            if intensity > max_intensity:
+                max_intensity = intensity
+        
+        # 正規化
+        if max_intensity > 0:
+            spectrum = spectrum / max_intensity
+            
+        return spectrum, peak_count, total_intensity
+
+    except:
+        return None, 0, 0.0
+
+def get_molecular_flags(mol):
+    """フラグ抽出"""
+    atoms = [a.GetSymbol() for a in mol.GetAtoms()]
+    bonds = [b.GetBondType() for b in mol.GetBonds()]
+    total_hydrogens = sum(a.GetTotalNumHs() for a in mol.GetAtoms())
+
+    flags = {}
+    flags['num_O'] = atoms.count('O')
+    flags['num_N'] = atoms.count('N')
+    flags['num_F'] = atoms.count('F')
+    flags['has_C'] = 1 if 'C' in atoms else 0
+    flags['has_O'] = 1 if 'O' in atoms else 0
+    flags['has_N'] = 1 if 'N' in atoms else 0
+    flags['has_F'] = 1 if 'F' in atoms else 0
+    flags['has_H'] = 1 if total_hydrogens > 0 else 0
     
-    avg_test_loss = test_loss / len(test_loader)
-    avg_test_sim = 1.0 - avg_test_loss
+    flags['has_single']   = 1 if Chem.BondType.SINGLE in bonds else 0
+    flags['has_double']   = 1 if Chem.BondType.DOUBLE in bonds else 0
+    flags['has_triple']   = 1 if Chem.BondType.TRIPLE in bonds else 0
+    flags['has_aromatic'] = 1 if Chem.BondType.AROMATIC in bonds else 0
+    flags['has_ring'] = 1 if mol.GetRingInfo().NumRings() > 0 else 0
+
+    for name, pattern in MOL_PATTERNS.items():
+        flags[name] = 1 if mol.HasSubstructMatch(pattern) else 0
+
+    return flags
+
+def is_ei_data(mol):
+    """
+    メタデータからEI(電子イオン化)っぽいか判定する簡易フィルタ
+    タグがない場合はTrue(除外しない)とみなす
+    """
+    # チェックするタグのリスト
+    tags_to_check = ["INSTRUMENT TYPE", "IONIZATION", "FRAGMENTATION MODE", "ION MODE"]
     
-    print(f"Test Loss (1-CosSim): {avg_test_loss:.4f}")
-    print(f"Test Similarity     : {avg_test_sim:.4f}")
-    print("------------------------------------")
+    found_tag = False
+    is_ei = False
+    
+    for tag in tags_to_check:
+        if mol.HasProp(tag):
+            val = mol.GetProp(tag).upper()
+            found_tag = True
+            # EI, ELECTRON, 70EV などのキーワードが含まれるか
+            # もしくは Ion Mode が P (Positive) であるか (GC-MSのEIは通常Positive)
+            if any(x in val for x in ["EI", "ELECTRON", "70", "P", "POS"]):
+                is_ei = True
+    
+    # タグが全くない、あるいは判定できない場合は、ユーザを信じてTrueを返す
+    if not found_tag:
+        return True
+        
+    return is_ei
+
+def process_sdf_best_selection(sdf_path, output_path):
+    # 重複排除用辞書: { inchikey: {data: row_dict, score: (peaks, intensity)} }
+    best_records = {}
+    
+    suppl = Chem.SDMolSupplier(sdf_path, sanitize=SANITIZE)
+    print(f"Reading {sdf_path} with STRICT mode...")
+    
+    processed_count = 0
+    skipped_struct = 0
+    skipped_spec = 0
+    error_count = 0
+    last_error = None
+    
+    for mol in tqdm(suppl):
+        if mol is None:
+            skipped_struct += 1
+            continue
+            
+        try:
+            # 1. 構造情報の取得
+            inchikey = Chem.MolToInchiKey(mol)
+            smiles = Chem.MolToSmiles(mol)
+            if not inchikey or not smiles:
+                skipped_struct += 1
+                continue
+
+            # 2. EIフィルタ (オプション)
+            if FILTER_EI and not is_ei_data(mol):
+                continue
+
+            # 3. スペクトル処理
+            if not mol.HasProp("MASS SPECTRAL PEAKS"):
+                skipped_spec += 1
+                continue
+                
+            raw_spec = mol.GetProp("MASS SPECTRAL PEAKS")
+            spectrum_array, peak_count, total_intensity = parse_spectrum(raw_spec, MAX_MZ)
+            
+            if spectrum_array is None or peak_count == 0:
+                skipped_spec += 1
+                continue
+
+            # 4. スコアリング (ピーク数優先、次に総強度)
+            current_score = (peak_count, total_intensity)
+            
+            # 5. ベスト更新ロジック
+            # 既に同じInChIKeyがあるか？
+            if inchikey in best_records:
+                existing_score = best_records[inchikey]['score']
+                # 現在の方がスコアが高ければ更新 (タプルの比較は左から順に行われる)
+                if current_score > existing_score:
+                    # フラグ取得 (更新時のみ計算してコスト削減…と言いたいが構造変わらないのでどちらでも可)
+                    # ここでは新しいmolからフラグを取り直す
+                    flags = get_molecular_flags(mol)
+                    row = {
+                        'smiles': smiles,
+                        'inchikey': inchikey,
+                        'spectrum': spectrum_array,
+                        **flags
+                    }
+                    best_records[inchikey] = {'data': row, 'score': current_score}
+            else:
+                # 新規登録
+                flags = get_molecular_flags(mol)
+                row = {
+                    'smiles': smiles,
+                    'inchikey': inchikey,
+                    'spectrum': spectrum_array,
+                    **flags
+                }
+                best_records[inchikey] = {'data': row, 'score': current_score}
+                
+            processed_count += 1
+            
+        except Exception as e:
+            error_count += 1
+            last_error = str(e)
+            continue
+
+    print("-" * 30)
+    print(f"Total processed: {processed_count}")
+    print(f"Skipped (Struct Error): {skipped_struct}")
+    print(f"Skipped (No Spec): {skipped_spec}")
+    if error_count:
+        print(f"Skipped (Exception): {error_count} | Last error: {last_error}")
+    print(f"Unique Molecules (InChIKey): {len(best_records)}")
+    
+    # DataFrame化
+    if len(best_records) > 0:
+        # 辞書からデータ部分のみを取り出す
+        final_data = [item['data'] for item in best_records.values()]
+        df = pd.DataFrame(final_data)
+
+        # 通し番号付与
+        df.insert(0, "entry_id", np.arange(len(df), dtype=np.int64))
+
+        # ndarray列をそのままParquetに書くと失敗するのでリスト化
+        df['spectrum'] = df['spectrum'].apply(lambda x: x.tolist())
+        
+        # Parquet保存
+        df.to_parquet(output_path, index=False, engine='pyarrow')
+        print(f"✅ Saved to {output_path}. Shape: {df.shape}")
+
+        # 簡易チェック
+        sample_spec = df.iloc[0]['spectrum']
+        if isinstance(sample_spec, list):
+            sample_spec = np.array(sample_spec, dtype=np.float32)
+        print("Sample Spectrum Max:", sample_spec.max() if len(sample_spec) > 0 else None)
+        print("Sample Spectrum Len:", len(sample_spec))
+    else:
+        print("❌ No valid data found.")
 
 if __name__ == "__main__":
-    run_training()
+    process_sdf_best_selection(INPUT_SDF, OUTPUT_PARQUET)
