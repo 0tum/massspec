@@ -1,13 +1,12 @@
 from typing import List, Optional
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-from sklearn.model_selection import train_test_split
 from rdkit import Chem
 from rdkit.Chem import Descriptors
 from rdkit.Chem import AllChem # 追加
@@ -15,11 +14,12 @@ from rdkit.Chem import rdFingerprintGenerator # 追加
 
 from torch.optim.lr_scheduler import CosineAnnealingLR # 追加
 
+from data import DEFAULT_PARQUET_FILE, split_dataset
 from features import ChemBERTaFeatureExtractor, get_hybrid_features
 from models import build_model, ModelConfig
 
 # --- 設定 ---
-PARQUET_FILE = "data/processed/MoNA.parquet" 
+PARQUET_FILE = DEFAULT_PARQUET_FILE 
 BATCH_SIZE = 64
 INTENSITY_POWER = 0.5 
 
@@ -27,7 +27,7 @@ INTENSITY_POWER = 0.5
 hparams_vanilla = {
     "learning_rate": 1e-3,
     "weight_decay": 1e-4,
-    "dropout_rate": 0.01,
+    "dropout_rate": 0.3544,
     "epochs": 100,
     "patience": 10,
     "cb_beta": None,
@@ -68,6 +68,7 @@ RUN_CONFIG = {
     "freeze": False,
 
     # Features
+    "feature_type": "ecfp+bert+flag",
     "structural_flag_columns": None,
     "feature_extractor": None,
     "inspect_input": False,
@@ -84,16 +85,23 @@ class MassSpecDataset(Dataset):
         structural_flag_columns: Optional[list] = None,
         feature_extractor: Optional[ChemBERTaFeatureExtractor] = None,
         feature_device: Optional[torch.device] = None,
-        use_ecfp: bool = True,     # 追加: ECFPを使うかスイッチ
+        feature_type: str = "ecfp+bert+flag",  # {"ecfp", "ecfp+bert+flag"}
         ecfp_radius: int = 2,
-        ecfp_bits: int = 1024,     # 4096だと重すぎるなら2048でも十分です
+        ecfp_bits: int = 4096,     #fearure_typeの変更のとき注意
     ):
         self.df = dataframe.reset_index(drop=True)
         self.mode = mode
         self.intensity_power = intensity_power
         self.flag_column = flag_column
         self.structural_flag_columns = structural_flag_columns or []
-        self.feature_extractor = feature_extractor or ChemBERTaFeatureExtractor(device=feature_device)
+        valid_feature_types = {"ecfp", "ecfp+bert+flag"}
+        if feature_type not in valid_feature_types:
+            raise ValueError(f"feature_type must be one of {valid_feature_types}, got '{feature_type}'")
+        self.feature_type = feature_type
+        self.use_bert = feature_type == "ecfp+bert+flag"
+        self.feature_extractor = None
+        if self.use_bert:
+            self.feature_extractor = feature_extractor or ChemBERTaFeatureExtractor(device=feature_device)
 
         features_list = []
         mw_list = []
@@ -101,10 +109,9 @@ class MassSpecDataset(Dataset):
         flag_list = [] if (flag_column and flag_column in self.df.columns) else None
 
         # 【追加】Generatorをここで作成（ループの外で作るのが推奨です）
-        if use_ecfp:
-            self.morgan_gen = rdFingerprintGenerator.GetMorganGenerator(
-                radius=ecfp_radius, fpSize=ecfp_bits
-            )
+        self.morgan_gen = rdFingerprintGenerator.GetMorganGenerator(
+            radius=ecfp_radius, fpSize=ecfp_bits
+        )
 
         for _, row in self.df.iterrows():
             mol = Chem.MolFromSmiles(row["smiles"])
@@ -120,23 +127,27 @@ class MassSpecDataset(Dataset):
             else:
                 spectrum = raw_spectrum
 
-            structural_flags = self._collect_structural_flags(row)
-            hybrid_features = get_hybrid_features(
-                smiles=canonical_smiles,
-                flags=structural_flags,
-                extractor=self.feature_extractor,
-                device=self.feature_extractor.device,
-                as_numpy=True,
-            )
+            feature_parts = []
+
+            if self.use_bert:
+                structural_flags = self._collect_structural_flags(row)
+                hybrid_features = get_hybrid_features(
+                    smiles=canonical_smiles,
+                    flags=structural_flags,
+                    extractor=self.feature_extractor,
+                    device=self.feature_extractor.device,
+                    as_numpy=True,
+                )
+                feature_parts.append(hybrid_features)
 
             # 2. ECFPの計算 (追加)
-            final_features = hybrid_features
-            if use_ecfp:
-                # RDKitでECFP生成（Generator APIに合わせてNumPyで直接取得）
-                ecfp_array = self.morgan_gen.GetFingerprintAsNumPy(mol).astype(np.float32)
-                
-                # 結合: [BERT(768) + Flags(N) + ECFP(2048)]
-                final_features = np.concatenate([hybrid_features, ecfp_array])
+            ecfp_array = self.morgan_gen.GetFingerprintAsNumPy(mol).astype(np.float32)
+            feature_parts.append(ecfp_array)
+
+            if len(feature_parts) == 1:
+                final_features = feature_parts[0]
+            else:
+                final_features = np.concatenate(feature_parts, axis=-1)
 
             # Tensor化してリストに追加
             features_list.append(torch.tensor(final_features, dtype=torch.float32))
@@ -205,6 +216,10 @@ def run_training(
     learning_rate: float = None,
     weight_decay: float = None,
     dropout_rate: Optional[float] = None,
+    hidden_units: int = 2000,
+    num_hidden_layers: int = 2,
+    ecfp_bits: int = 1024,
+    feature_type: str = "ecfp+bert+flag",  # {"ecfp", "ecfp+bert+flag"}
     epochs: int = None,
     patience: int = None,
     model_save_path: Optional[str] = "model/mass_spec_model.pth",
@@ -229,104 +244,23 @@ def run_training(
     if train_mode not in ("vanilla", "class_balanced_loss"):
         raise ValueError(f"Unsupported train_mode '{train_mode}'. Use 'vanilla' or 'class_balanced_loss'.")
 
-    # --- Step 0: load and basic checks ---
-    df = pd.read_parquet(PARQUET_FILE)
-    if flag_column not in df.columns:
-        raise ValueError(f"flag_column '{flag_column}' not found in dataframe")
+    # --- Step 0: load and split data ---
     cb_beta_val = cb_beta if cb_beta is not None else 0.99
     flag_boost_val = flag_boost if flag_boost is not None else 1.0
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    manual_split_requested = (not domain_split) and any(sz is not None for sz in (train_size, val_size, test_size))
-
-    def _resolve_split_sizes(total: int) -> dict:
-        """Decide how many molecules go to each split when manual sizes are requested."""
-        sizes = {"train": train_size, "val": val_size, "test": test_size}
-        for name, val in sizes.items():
-            if val is not None and val < 0:
-                raise ValueError(f"{name}_size must be >= 0, got {val}")
-        specified_sum = sum(v for v in sizes.values() if v is not None)
-        if specified_sum > total:
-            raise ValueError(f"Requested split sizes exceed dataset size: requested={specified_sum}, available={total}")
-
-        missing = [k for k, v in sizes.items() if v is None]
-        remaining = total - specified_sum
-        if missing:
-            default_ratios = {
-                "train": max(0.0, 1.0 - val_ratio - test_ratio),
-                "val": val_ratio,
-                "test": test_ratio,
-            }
-            ratio_sum = sum(default_ratios[m] for m in missing)
-            if ratio_sum <= 0:
-                ratio_sum = len(missing)
-                default_ratios = {m: 1.0 for m in missing}
-
-            for m in missing:
-                sizes[m] = int(round(remaining * default_ratios[m] / ratio_sum))
-
-            # Adjust rounding by giving/taking the difference to the train split
-            final_sum = sum(sizes.values())
-            if final_sum < total:
-                sizes["train"] += total - final_sum
-            elif final_sum > total:
-                sizes["train"] = max(0, sizes["train"] - (final_sum - total))
-
-        return sizes
-
-    if domain_split and manual_split_requested:
-        raise ValueError("Manual split sizes are only supported when domain_split=False.")
-
-    if manual_split_requested:
-        print("Using simple random split by molecule counts (domain_split=False). n_pos/n_neg are ignored.")
-        df_shuffled = df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
-        split_sizes = _resolve_split_sizes(len(df_shuffled))
-
-        train_end = split_sizes["train"]
-        val_end = train_end + split_sizes["val"]
-        test_end = val_end + split_sizes["test"]
-
-        train_df = df_shuffled.iloc[:train_end]
-        val_df = df_shuffled.iloc[train_end:val_end]
-        test_df = df_shuffled.iloc[val_end:test_end]
-        print(f"Split sizes (molecules): train={len(train_df)}, val={len(val_df)}, test={len(test_df)}")
-    else:
-        # --- Step 1: stratified Test split ---
-        train_val_df, test_df = train_test_split(
-            df,
-            test_size=test_ratio,
-            random_state=seed,
-            stratify=df[flag_column],
-        )
-
-        # --- Step 2: stratified Val split from remaining ---
-        adj_val_ratio = val_ratio / (1.0 - test_ratio)
-        train_full_df, val_df = train_test_split(
-            train_val_df,
-            test_size=adj_val_ratio,
-            random_state=seed,
-            stratify=train_val_df[flag_column],
-        )
-
-        # --- Step 3: downsample Train_Full to requested n_pos/n_neg ---
-        flag_series = train_full_df[flag_column].astype(bool)
-        pool_pos = train_full_df[flag_series]
-        pool_neg = train_full_df[~flag_series]
-
-        if n_pos > len(pool_pos):
-            raise ValueError(f"Requested n_pos={n_pos}, but only {len(pool_pos)} positives available in train pool")
-        if n_neg > len(pool_neg):
-            raise ValueError(f"Requested n_neg={n_neg}, but only {len(pool_neg)} negatives available in train pool")
-
-        rng = np.random.default_rng(seed)
-        pos_idx = rng.choice(len(pool_pos), size=n_pos, replace=False)
-        neg_idx = rng.choice(len(pool_neg), size=n_neg, replace=False)
-
-        train_df = pd.concat([
-            pool_pos.iloc[pos_idx],
-            pool_neg.iloc[neg_idx],
-        ], axis=0)
-        train_df = train_df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    train_df, val_df, test_df = split_dataset(
+        seed=seed,
+        flag_column=flag_column,
+        domain_split=domain_split,
+        n_pos=n_pos,
+        n_neg=n_neg,
+        train_size=train_size,
+        val_size=val_size,
+        test_size=test_size,
+        val_ratio=val_ratio,
+        test_ratio=test_ratio,
+        parquet_file=PARQUET_FILE,
+    )
 
     # クラスバランス重みの計算（train_df上で実施）
     use_cb_loss = train_mode == "class_balanced_loss"
@@ -359,7 +293,10 @@ def run_training(
     _count_pos_neg(test_df, "Test (fixed)")
 
     flag_cols = structural_flag_columns or []
-    feature_extractor = feature_extractor or ChemBERTaFeatureExtractor()
+    if feature_type == "ecfp+bert+flag":
+        feature_extractor = feature_extractor or ChemBERTaFeatureExtractor()
+    else:
+        feature_extractor = None
     
     # Datasetに intensity_power を渡す
     train_dataset = MassSpecDataset(
@@ -369,6 +306,8 @@ def run_training(
         flag_column=flag_column,
         structural_flag_columns=flag_cols,
         feature_extractor=feature_extractor,
+        feature_type=feature_type,
+        ecfp_bits=ecfp_bits,
     )
     val_dataset = MassSpecDataset(
         val_df,
@@ -377,6 +316,8 @@ def run_training(
         flag_column=flag_column,
         structural_flag_columns=flag_cols,
         feature_extractor=feature_extractor,
+        feature_type=feature_type,
+        ecfp_bits=ecfp_bits,
     )
 
     pin_memory = torch.cuda.is_available()
@@ -406,18 +347,28 @@ def run_training(
     if inspect_input:
         batch = next(iter(train_loader))
         features = batch["features"]
-        bert_part = features[:, :768]
-        flag_part = features[:, 768:]
-
         print("# 入力の分布を確認")
-        print(f"BERT Mean: {bert_part.mean():.4f}, Std: {bert_part.std():.4f}")
-        print(f"BERT Min:  {bert_part.min():.4f},  Max: {bert_part.max():.4f}")
-        print("-" * 30)
-        if flag_part.numel() > 0:
-            print(f"Flag Mean: {flag_part.mean():.4f}, Std: {flag_part.std():.4f}")
-            print(f"Flag Min:  {flag_part.min():.4f},  Max: {flag_part.max():.4f}")
+        if feature_type == "ecfp+bert+flag":
+            bert_dim = 768
+            bert_part = features[:, :bert_dim]
+            remaining = features[:, bert_dim:]
+            flag_dim = max(0, remaining.shape[1] - ecfp_bits)
+            flag_part = remaining[:, :flag_dim] if flag_dim > 0 else None
+            ecfp_part = remaining[:, flag_dim:]
+
+            print(f"BERT Mean: {bert_part.mean():.4f}, Std: {bert_part.std():.4f}")
+            print(f"BERT Min:  {bert_part.min():.4f},  Max: {bert_part.max():.4f}")
+            print("-" * 30)
+            if flag_part is not None and flag_part.numel() > 0:
+                print(f"Flag Mean: {flag_part.mean():.4f}, Std: {flag_part.std():.4f}")
+                print(f"Flag Min:  {flag_part.min():.4f},  Max: {flag_part.max():.4f}")
+                print("-" * 30)
+            print(f"ECFP Mean: {ecfp_part.mean():.4f}, Std: {ecfp_part.std():.4f}")
+            print(f"ECFP Min:  {ecfp_part.min():.4f},  Max: {ecfp_part.max():.4f}")
         else:
-            print("Flag Part: (no flags provided)")
+            ecfp_part = features
+            print(f"ECFP Mean: {ecfp_part.mean():.4f}, Std: {ecfp_part.std():.4f}")
+            print(f"ECFP Min:  {ecfp_part.min():.4f},  Max: {ecfp_part.max():.4f}")
 
         return {
             "overall": None,
@@ -438,14 +389,15 @@ def run_training(
     config = ModelConfig(
         fp_length=total_input_dim,
         max_mass_spec_peak_loc=train_dataset.spec_len,
-        hidden_units=2000,
-        num_hidden_layers=2,
+        hidden_units=hidden_units,
+        num_hidden_layers=num_hidden_layers,
         dropout_rate=dropout_rate if dropout_rate is not None else 0.25,
         bidirectional_prediction=True,
         gate_bidirectional_predictions=True,
         
         # Configにも記録しておく (models.pyの内部ロジックでは使われないが整合性のため)
         intensity_power=INTENSITY_POWER,
+        feature_type=feature_type,
         
         # Loss指定: models.pyのforward出力は ReLU(raw) になる
         # CosineLossを使うならReLUで0以上にクリップされているのは好都合
@@ -670,6 +622,8 @@ def run_training(
             flag_column=flag_column,
             structural_flag_columns=flag_cols,
             feature_extractor=feature_extractor,
+            feature_type=feature_type,
+            ecfp_bits=ecfp_bits,
         )
         loader = DataLoader(
             dataset,

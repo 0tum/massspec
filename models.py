@@ -49,6 +49,9 @@ class ModelConfig:
     intensity_power: float = 0.5
     mass_power: float = 1.0
 
+    # Input feature selection
+    feature_type: str = "ecfp"  # {"ecfp", "ecfp+bert+flag"}
+
     device: torch.device = field(default_factory=lambda: torch.device("cpu"))
     dtype: torch.dtype = torch.float32
 
@@ -340,5 +343,4 @@ class MLPSpectraModel(MassSpectraModel):
         x = self.final_bn(x)
         x = self.activation(x)
         return x
-
 

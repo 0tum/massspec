@@ -14,19 +14,22 @@ FLAG_BOOST = 1.0
 SEEDS = [0, 1, 2, 3, 4]
 POS_COUNTS = [10, 100, 120]
 TOTAL_SAMPLES = 5000
-OUTPUT_CSV = f"output/csv/{FLAG_COLUMN}-{TRAIN_MODE}-esmetric={VAL_METRIC}.csv"
+OUTPUT_CSV = f"tmp/{FLAG_COLUMN}-{TRAIN_MODE}-scaling_ecfp+bert+flag.csv"
 # OUTPUT_FIG = "scaling_error_bars.png"
+
+DOMAIN_SPLIT = False  # Falseならtrain/val/testをドメイン分割で行う
+TRAIN_NUM = [500, 1000, 2000, 5000, 7000]
+VAL_NUM = 500     # DOMAIN_SPLIT=Falseのときのvalサイズ
+TEST_NUM = 1000   # DOMAIN_SPLIT=Falseのときのtestサイズ
 
 
 # hparams dict
 hparams_vanilla = {
-    "learning_rate": 0.00017765451354316748,
-    "weight_decay": 0.0003033795426729229,
-    "dropout_rate": 0.3420465041712287,
-    "epochs": 94,
-    "patience": 26,
-    "cb_beta": None,
-    "flag_boost": None,
+    "learning_rate": 1e-3,
+    "weight_decay": 1e-4,
+    "dropout_rate": 0.3544,
+    "epochs": 100,
+    "patience": 10,
 }
 
 hparams_class_balanced_loss = {
@@ -47,47 +50,90 @@ else:
 
 def main():
     records = []
-
-    for n_pos in tqdm(POS_COUNTS, desc="n_pos sweep"):
-        n_neg = TOTAL_SAMPLES - n_pos
-        if n_neg <= 0:
-            print(f"Skip n_pos={n_pos}: TOTAL_SAMPLES={TOTAL_SAMPLES} not enough for neg")
-            continue
-
-        for seed in tqdm(SEEDS, desc="seeds", leave=False):
-            try:
-                res = run_training(
-                    n_pos=n_pos, 
-                    n_neg=n_neg, 
-                    seed=seed,
-                    flag_column=FLAG_COLUMN,
-                    train_mode=TRAIN_MODE,
-                    cb_beta=hparams["cb_beta"],
-                    flag_boost=hparams["flag_boost"],
-                    weighted_sampler=False,
-                    learning_rate=hparams["learning_rate"],  
-                    weight_decay=hparams["weight_decay"],  
-                    dropout_rate=hparams["dropout_rate"], 
-                    epochs=hparams["epochs"],
-                    patience=hparams["patience"],
-                    early_stopping_metric=VAL_METRIC, 
-                    )
-            except ValueError as e:
-                # 例: プールに十分なデータがない場合
-                print(f"Skip n_pos={n_pos}, seed={seed}: {e}")
+    if DOMAIN_SPLIT:
+        for n_pos in tqdm(POS_COUNTS, desc="n_pos sweep"):
+            n_neg = TOTAL_SAMPLES - n_pos
+            if n_neg <= 0:
+                print(f"Skip n_pos={n_pos}: TOTAL_SAMPLES={TOTAL_SAMPLES} not enough for neg")
                 continue
 
-            records.append(
-                {
-                    "n_pos_req": n_pos,
-                    "n_neg_req": n_neg,
-                    "seed": seed,
-                    "pos_acc": res.get("pos"),
-                    "neg_acc": res.get("neg"),
-                    "overall_acc": res.get("overall"),
-                    "best_epoch": res.get("best_epoch"),
-                }
-            )
+            for seed in tqdm(SEEDS, desc="seeds", leave=False):
+                try:
+                    res = run_training(
+                        n_pos=n_pos, 
+                        n_neg=n_neg, 
+                        seed=seed,
+                        flag_column=FLAG_COLUMN,
+                        train_mode=TRAIN_MODE,
+                        # cb_beta=hparams["cb_beta"],
+                        # flag_boost=hparams["flag_boost"],
+                        # weighted_sampler=False,
+                        learning_rate=hparams["learning_rate"],  
+                        weight_decay=hparams["weight_decay"],  
+                        dropout_rate=hparams["dropout_rate"], 
+                        epochs=hparams["epochs"],
+                        patience=hparams["patience"],
+                        early_stopping_metric=VAL_METRIC, 
+                        domain_split=True,
+                        feature_type="ecfp+bert+flag",  # ecfpのみ
+                        ecfp_bits=1024,
+                        )
+                except ValueError as e:
+                    # 例: プールに十分なデータがない場合
+                    print(f"Skip n_pos={n_pos}, seed={seed}: {e}")
+                    continue
+
+                records.append(
+                    {
+                        "n_pos_req": n_pos,
+                        "n_neg_req": n_neg,
+                        "seed": seed,
+                        "pos_acc": res.get("pos"),
+                        "neg_acc": res.get("neg"),
+                        "overall_acc": res.get("overall"),
+                        "best_epoch": res.get("best_epoch"),
+                    }
+                )
+    else:
+        for n_train in tqdm(TRAIN_NUM, desc="train size sweep"):
+            for seed in tqdm(SEEDS, desc="seeds", leave=False):
+                try:
+                    res = run_training(
+                        n_pos=None,
+                        n_neg=None,
+                        seed=seed,
+                        flag_column=FLAG_COLUMN,
+                        train_mode=TRAIN_MODE,
+                        # cb_beta=hparams["cb_beta"],
+                        # flag_boost=hparams["flag_boost"],
+                        # weighted_sampler=False,
+                        learning_rate=hparams["learning_rate"],  
+                        weight_decay=hparams["weight_decay"],  
+                        dropout_rate=hparams["dropout_rate"], 
+                        epochs=hparams["epochs"],
+                        patience=hparams["patience"],
+                        early_stopping_metric=VAL_METRIC, 
+                        domain_split=False,
+                        train_size=n_train,
+                        val_size=VAL_NUM,
+                        test_size=TEST_NUM,
+                    )
+                except ValueError as e:
+                    print(f"Skip n_train={n_train}, seed={seed}: {e}")
+                    continue
+
+                records.append(
+                    {
+                        "n_train": n_train,
+                        "n_val": VAL_NUM,
+                        "n_test": TEST_NUM,
+                        "seed": seed,
+                        "pos_acc": res.get("pos"),
+                        "neg_acc": res.get("neg"),
+                        "overall_acc": res.get("overall"),
+                        "best_epoch": res.get("best_epoch"),
+                    }
+                )
 
     df = pd.DataFrame(records)
     df.to_csv(OUTPUT_CSV, index=False)
