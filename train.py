@@ -1,4 +1,3 @@
-import argparse
 from typing import List, Optional
 
 import pandas as pd
@@ -11,6 +10,8 @@ from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from sklearn.model_selection import train_test_split
 from rdkit import Chem
 from rdkit.Chem import Descriptors
+from rdkit.Chem import AllChem # 追加
+from rdkit.Chem import rdFingerprintGenerator # 追加
 
 from torch.optim.lr_scheduler import CosineAnnealingLR # 追加
 
@@ -18,31 +19,59 @@ from features import ChemBERTaFeatureExtractor, get_hybrid_features
 from models import build_model, ModelConfig
 
 # --- 設定 ---
-PARQUET_FILE = "data/processed/MoNA.parquet"
+PARQUET_FILE = "data/processed/MoNA.parquet" 
 BATCH_SIZE = 64
-LR = 0.00017765451354316748
-WEIGHT_DECAY = 0.0003033795426729229
-EPOCHS = 200
 INTENSITY_POWER = 0.5 
-PATIENCE = 10  # early stopping の猶予エポック数
 
-# Experiment settings
-FLAG_COLUMN = "has_F"
-TRAIN_MODE = "vanilla"  # "vanilla" or "class_balanced_loss"
-VAL_METRIC = "val_loss"  # {"val_loss", "val_pos_loss"}
-
-# hparams dict
+# # hparams dict
 hparams_vanilla = {
     "learning_rate": 1e-3,
     "weight_decay": 1e-4,
-    "dropout_rate": 0.20,
-    "epochs": EPOCHS,
-    "patience": PATIENCE,
+    "dropout_rate": 0.01,
+    "epochs": 100,
+    "patience": 10,
     "cb_beta": None,
     "flag_boost": None,
 }
-
 hparams = hparams_vanilla
+
+# --- Hard-coded run configuration (no CLI needed) ---
+RUN_CONFIG = {
+    # Split/seed settings
+    "n_pos": 100,
+    "n_neg": 4900,
+    "seed": 0,
+    "flag_column": "has_F",
+    "domain_split": False,      # Falseで下のtrain/val/test_sizeが有効
+    "train_size": 8000,         # 例: 4000
+    "val_size": 500,           # 例: 500
+    "test_size": 1000,          # 例: 500
+
+    # Training mode & loss
+    "train_mode": "vanilla", # "vanilla" or "class_balanced_loss"
+    "cb_beta": hparams["cb_beta"],
+    "flag_boost": hparams["flag_boost"],
+    "early_stopping_metric": "val_loss",  # "val_loss", "val_pos_loss"
+
+    # Optimization
+    "learning_rate": hparams["learning_rate"],
+    "weight_decay": hparams["weight_decay"],
+    "dropout_rate": hparams["dropout_rate"],
+    "epochs": hparams["epochs"],
+    "patience": hparams["patience"],
+    "weighted_sampler": False,
+    "compile_model": False,
+
+    # Files / model options
+    "model_save_path": "model/mass_spec_model.pth",
+    "pretrained_path": None,
+    "freeze": False,
+
+    # Features
+    "structural_flag_columns": None,
+    "feature_extractor": None,
+    "inspect_input": False,
+}
 
 # --- 1. Datasetクラス (修正版) ---
 class MassSpecDataset(Dataset):
@@ -55,6 +84,9 @@ class MassSpecDataset(Dataset):
         structural_flag_columns: Optional[list] = None,
         feature_extractor: Optional[ChemBERTaFeatureExtractor] = None,
         feature_device: Optional[torch.device] = None,
+        use_ecfp: bool = True,     # 追加: ECFPを使うかスイッチ
+        ecfp_radius: int = 2,
+        ecfp_bits: int = 1024,     # 4096だと重すぎるなら2048でも十分です
     ):
         self.df = dataframe.reset_index(drop=True)
         self.mode = mode
@@ -67,6 +99,12 @@ class MassSpecDataset(Dataset):
         mw_list = []
         spectrum_list = []
         flag_list = [] if (flag_column and flag_column in self.df.columns) else None
+
+        # 【追加】Generatorをここで作成（ループの外で作るのが推奨です）
+        if use_ecfp:
+            self.morgan_gen = rdFingerprintGenerator.GetMorganGenerator(
+                radius=ecfp_radius, fpSize=ecfp_bits
+            )
 
         for _, row in self.df.iterrows():
             mol = Chem.MolFromSmiles(row["smiles"])
@@ -88,10 +126,20 @@ class MassSpecDataset(Dataset):
                 flags=structural_flags,
                 extractor=self.feature_extractor,
                 device=self.feature_extractor.device,
-                as_numpy=False,
-            ).cpu()
+                as_numpy=True,
+            )
 
-            features_list.append(hybrid_features)
+            # 2. ECFPの計算 (追加)
+            final_features = hybrid_features
+            if use_ecfp:
+                # RDKitでECFP生成（Generator APIに合わせてNumPyで直接取得）
+                ecfp_array = self.morgan_gen.GetFingerprintAsNumPy(mol).astype(np.float32)
+                
+                # 結合: [BERT(768) + Flags(N) + ECFP(2048)]
+                final_features = np.concatenate([hybrid_features, ecfp_array])
+
+            # Tensor化してリストに追加
+            features_list.append(torch.tensor(final_features, dtype=torch.float32))
             mw_list.append(torch.tensor([mw], dtype=torch.float32))
             spectrum_list.append(torch.from_numpy(spectrum))
 
@@ -164,8 +212,16 @@ def run_training(
     freeze: bool = False,
     feature_extractor: Optional[ChemBERTaFeatureExtractor] = None,
     inspect_input: bool = False,
+    domain_split: bool = False,
+    train_size: Optional[int] = 7000,
+    val_size: Optional[int] = 500,
+    test_size: Optional[int] = 1000,
 )-> dict:
-    """Train model with fixed stratified Test/Val and downsampled Train.
+    """Train model with either a stratified flag-aware split or a simple size-based split.
+
+    - If domain_split is False *and* any of train_size/val_size/test_size is given,
+      the dataset is shuffled and split by the requested molecule counts (n_pos/n_neg are ignored).
+    - Otherwise, perform the original flag-aware stratified split and downsample train by n_pos/n_neg.
 
     Returns dict with cosine similarities on the fixed test set.
     """
@@ -181,42 +237,96 @@ def run_training(
     flag_boost_val = flag_boost if flag_boost is not None else 1.0
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # --- Step 1: stratified Test split ---
-    train_val_df, test_df = train_test_split(
-        df,
-        test_size=test_ratio,
-        random_state=seed,
-        stratify=df[flag_column],
-    )
+    manual_split_requested = (not domain_split) and any(sz is not None for sz in (train_size, val_size, test_size))
 
-    # --- Step 2: stratified Val split from remaining ---
-    adj_val_ratio = val_ratio / (1.0 - test_ratio)
-    train_full_df, val_df = train_test_split(
-        train_val_df,
-        test_size=adj_val_ratio,
-        random_state=seed,
-        stratify=train_val_df[flag_column],
-    )
+    def _resolve_split_sizes(total: int) -> dict:
+        """Decide how many molecules go to each split when manual sizes are requested."""
+        sizes = {"train": train_size, "val": val_size, "test": test_size}
+        for name, val in sizes.items():
+            if val is not None and val < 0:
+                raise ValueError(f"{name}_size must be >= 0, got {val}")
+        specified_sum = sum(v for v in sizes.values() if v is not None)
+        if specified_sum > total:
+            raise ValueError(f"Requested split sizes exceed dataset size: requested={specified_sum}, available={total}")
 
-    # --- Step 3: downsample Train_Full to requested n_pos/n_neg ---
-    flag_series = train_full_df[flag_column].astype(bool)
-    pool_pos = train_full_df[flag_series]
-    pool_neg = train_full_df[~flag_series]
+        missing = [k for k, v in sizes.items() if v is None]
+        remaining = total - specified_sum
+        if missing:
+            default_ratios = {
+                "train": max(0.0, 1.0 - val_ratio - test_ratio),
+                "val": val_ratio,
+                "test": test_ratio,
+            }
+            ratio_sum = sum(default_ratios[m] for m in missing)
+            if ratio_sum <= 0:
+                ratio_sum = len(missing)
+                default_ratios = {m: 1.0 for m in missing}
 
-    if n_pos > len(pool_pos):
-        raise ValueError(f"Requested n_pos={n_pos}, but only {len(pool_pos)} positives available in train pool")
-    if n_neg > len(pool_neg):
-        raise ValueError(f"Requested n_neg={n_neg}, but only {len(pool_neg)} negatives available in train pool")
+            for m in missing:
+                sizes[m] = int(round(remaining * default_ratios[m] / ratio_sum))
 
-    rng = np.random.default_rng(seed)
-    pos_idx = rng.choice(len(pool_pos), size=n_pos, replace=False)
-    neg_idx = rng.choice(len(pool_neg), size=n_neg, replace=False)
+            # Adjust rounding by giving/taking the difference to the train split
+            final_sum = sum(sizes.values())
+            if final_sum < total:
+                sizes["train"] += total - final_sum
+            elif final_sum > total:
+                sizes["train"] = max(0, sizes["train"] - (final_sum - total))
 
-    train_df = pd.concat([
-        pool_pos.iloc[pos_idx],
-        pool_neg.iloc[neg_idx],
-    ], axis=0)
-    train_df = train_df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+        return sizes
+
+    if domain_split and manual_split_requested:
+        raise ValueError("Manual split sizes are only supported when domain_split=False.")
+
+    if manual_split_requested:
+        print("Using simple random split by molecule counts (domain_split=False). n_pos/n_neg are ignored.")
+        df_shuffled = df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+        split_sizes = _resolve_split_sizes(len(df_shuffled))
+
+        train_end = split_sizes["train"]
+        val_end = train_end + split_sizes["val"]
+        test_end = val_end + split_sizes["test"]
+
+        train_df = df_shuffled.iloc[:train_end]
+        val_df = df_shuffled.iloc[train_end:val_end]
+        test_df = df_shuffled.iloc[val_end:test_end]
+        print(f"Split sizes (molecules): train={len(train_df)}, val={len(val_df)}, test={len(test_df)}")
+    else:
+        # --- Step 1: stratified Test split ---
+        train_val_df, test_df = train_test_split(
+            df,
+            test_size=test_ratio,
+            random_state=seed,
+            stratify=df[flag_column],
+        )
+
+        # --- Step 2: stratified Val split from remaining ---
+        adj_val_ratio = val_ratio / (1.0 - test_ratio)
+        train_full_df, val_df = train_test_split(
+            train_val_df,
+            test_size=adj_val_ratio,
+            random_state=seed,
+            stratify=train_val_df[flag_column],
+        )
+
+        # --- Step 3: downsample Train_Full to requested n_pos/n_neg ---
+        flag_series = train_full_df[flag_column].astype(bool)
+        pool_pos = train_full_df[flag_series]
+        pool_neg = train_full_df[~flag_series]
+
+        if n_pos > len(pool_pos):
+            raise ValueError(f"Requested n_pos={n_pos}, but only {len(pool_pos)} positives available in train pool")
+        if n_neg > len(pool_neg):
+            raise ValueError(f"Requested n_neg={n_neg}, but only {len(pool_neg)} negatives available in train pool")
+
+        rng = np.random.default_rng(seed)
+        pos_idx = rng.choice(len(pool_pos), size=n_pos, replace=False)
+        neg_idx = rng.choice(len(pool_neg), size=n_neg, replace=False)
+
+        train_df = pd.concat([
+            pool_pos.iloc[pos_idx],
+            pool_neg.iloc[neg_idx],
+        ], axis=0)
+        train_df = train_df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
 
     # クラスバランス重みの計算（train_df上で実施）
     use_cb_loss = train_mode == "class_balanced_loss"
@@ -609,45 +719,9 @@ def run_training(
 
     return results
 
-def _parse_args():
-    parser = argparse.ArgumentParser(description="Train NEIMS model with ChemBERTa features.")
-    parser.add_argument("--n_pos", type=int, default=100, help="Number of positive samples for train split.")
-    parser.add_argument("--n_neg", type=int, default=4900, help="Number of negative samples for train split.")
-    parser.add_argument("--seed", type=int, default=0, help="Random seed.")
-    parser.add_argument("--flag_column", type=str, default=FLAG_COLUMN, help="Flag column name in dataframe.")
-    parser.add_argument("--train_mode", type=str, choices=["vanilla", "class_balanced_loss"], default=TRAIN_MODE, help="Training mode.")
-    parser.add_argument("--early_stopping_metric", type=str, choices=["val_loss", "val_pos_loss"], default=VAL_METRIC, help="Metric for early stopping.")
-    parser.add_argument("--epochs", type=int, default=None, help="Override epochs.")
-    parser.add_argument("--patience", type=int, default=None, help="Override patience.")
-    parser.add_argument("--learning_rate", type=float, default=None, help="Override learning rate.")
-    parser.add_argument("--weight_decay", type=float, default=None, help="Override weight decay.")
-    parser.add_argument("--dropout_rate", type=float, default=None, help="Override dropout rate.")
-    parser.add_argument("--structural_flag_columns", type=str, nargs="*", default=None, help="List of structural flag columns to concatenate with ChemBERTa embedding.")
-    parser.add_argument("--model_save_path", type=str, default="model/mass_spec_model.pth", help="Path to save best model.")
-    parser.add_argument("--inspect_input", default=False, action="store_true", help="Skip training and only print input feature statistics.")
-    return parser.parse_args()
-
-
 def _main_cli():
-    args = _parse_args()
     res = run_training(
-        n_pos=args.n_pos,
-        n_neg=args.n_neg,
-        seed=args.seed,
-        flag_column=args.flag_column,
-        structural_flag_columns=args.structural_flag_columns,
-        train_mode=args.train_mode,
-        cb_beta=hparams["cb_beta"],
-        flag_boost=hparams["flag_boost"],
-        weighted_sampler=False,
-        learning_rate=args.learning_rate or hparams["learning_rate"],
-        weight_decay=args.weight_decay or hparams["weight_decay"],
-        dropout_rate=args.dropout_rate or hparams["dropout_rate"],
-        epochs=args.epochs or hparams["epochs"],
-        patience=args.patience or hparams["patience"],
-        early_stopping_metric=args.early_stopping_metric,
-        model_save_path=args.model_save_path,
-        inspect_input=args.inspect_input,
+        **RUN_CONFIG,
     )
 
     def _fmt(val: Optional[float]) -> str:
@@ -655,8 +729,8 @@ def _main_cli():
 
     print("\n=== Test Cosine Similarity ===")
     print(f"Overall: {_fmt(res.get('overall'))} (n={res.get('n_overall', 'N/A')})")
-    print(f"Pos ({args.flag_column}=1): {_fmt(res.get('pos'))} (n={res.get('n_pos', 'N/A')})")
-    print(f"Neg ({args.flag_column}=0): {_fmt(res.get('neg'))} (n={res.get('n_neg', 'N/A')})")
+    print(f"Pos ({RUN_CONFIG['flag_column']}=1): {_fmt(res.get('pos'))} (n={res.get('n_pos', 'N/A')})")
+    print(f"Neg ({RUN_CONFIG['flag_column']}=0): {_fmt(res.get('neg'))} (n={res.get('n_neg', 'N/A')})")
     print(f"Best epoch: {res.get('best_epoch', 'N/A')} | Val loss: {_fmt(res.get('val_loss'))}")
 
 
