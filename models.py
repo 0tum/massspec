@@ -37,7 +37,7 @@ class ModelConfig:
 
     hidden_units: int = 2000
     num_hidden_layers: int = 2  
-    dropout_rate: float = 0.25
+    dropout_rate: float = 0.3420465041712287
     activation: str = "relu"
     resnet_bottleneck_factor: float = 0.5
 
@@ -295,6 +295,11 @@ class MLPSpectraModel(MassSpectraModel):
         super().__init__(config=config)
         cfg = self.config
 
+        # --- 【追加】入力データを正規化する層 ---
+        # SafeBatchNorm1d はこのファイル内で定義されているのでそのまま使えます
+        self.input_bn = SafeBatchNorm1d(cfg.fp_length) 
+        # ------------------------------------
+
         self.feature_dim = cfg.hidden_units if cfg.num_hidden_layers > 0 else cfg.fp_length
         self.input_layer = (
             nn.Linear(cfg.fp_length, cfg.hidden_units)
@@ -324,6 +329,9 @@ class MLPSpectraModel(MassSpectraModel):
 
     def encode_features(self, fingerprint: torch.Tensor) -> torch.Tensor:
         x = fingerprint.to(device=self.config.device, dtype=self.config.dtype)
+        # --- 【追加】最初に正規化！ ---
+        x = self.input_bn(x)
+        # ---------------------------
         x = self.input_layer(x)
         if not isinstance(self.input_layer, nn.Identity):
             x = self.activation(x)
