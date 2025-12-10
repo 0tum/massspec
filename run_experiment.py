@@ -7,14 +7,13 @@ from train import run_training
 
 # Experiment settings
 FLAG_COLUMN = "has_F"
-TRAIN_MODE = "vanilla"  # "vanilla" or "class_balanced_loss"
 VAL_METRIC = "val_loss"  # {"val_loss", "val_pos_loss"}
-# CB_BETA = 0.999
-FLAG_BOOST = 1.0
+USED_FEATURES = "ecfp+flag"  # {"ecfp", "only", "ecfp+bert", "ecfp+bert+flag"}
+ECFP_BITS = 1024
 SEEDS = [0, 1, 2, 3, 4]
 POS_COUNTS = [10, 100, 120]
 TOTAL_SAMPLES = 5000
-OUTPUT_CSV = f"tmp/{FLAG_COLUMN}-{TRAIN_MODE}-scaling_ecfp+bert+flag.csv"
+OUTPUT_CSV = f"tmp/scaling/scaling-{FLAG_COLUMN}-{USED_FEATURES}_ALLflags.csv"
 # OUTPUT_FIG = "scaling_error_bars.png"
 
 DOMAIN_SPLIT = False  # Falseならtrain/val/testをドメイン分割で行う
@@ -32,20 +31,7 @@ hparams_vanilla = {
     "patience": 10,
 }
 
-hparams_class_balanced_loss = {
-    "learning_rate": 0.00018579356614638177,
-    "weight_decay": 0.00010558384297715928,
-    "dropout_rate": 0.34145869213527447,
-    "epochs": 118,
-    "patience": 30,
-    "cb_beta": 0.990110725960859,
-    "flag_boost": 1.768852367763028,
-}
-
-if TRAIN_MODE == "vanilla":
-    hparams = hparams_vanilla
-else:
-    hparams = hparams_class_balanced_loss
+hparams = hparams_vanilla
 
 
 def main():
@@ -64,10 +50,6 @@ def main():
                         n_neg=n_neg, 
                         seed=seed,
                         flag_column=FLAG_COLUMN,
-                        train_mode=TRAIN_MODE,
-                        # cb_beta=hparams["cb_beta"],
-                        # flag_boost=hparams["flag_boost"],
-                        # weighted_sampler=False,
                         learning_rate=hparams["learning_rate"],  
                         weight_decay=hparams["weight_decay"],  
                         dropout_rate=hparams["dropout_rate"], 
@@ -75,8 +57,8 @@ def main():
                         patience=hparams["patience"],
                         early_stopping_metric=VAL_METRIC, 
                         domain_split=True,
-                        feature_type="ecfp+bert+flag",  # ecfpのみ
-                        ecfp_bits=1024,
+                        feature_type=USED_FEATURES,  
+                        ecfp_bits=ECFP_BITS,
                         )
                 except ValueError as e:
                     # 例: プールに十分なデータがない場合
@@ -103,10 +85,6 @@ def main():
                         n_neg=None,
                         seed=seed,
                         flag_column=FLAG_COLUMN,
-                        train_mode=TRAIN_MODE,
-                        # cb_beta=hparams["cb_beta"],
-                        # flag_boost=hparams["flag_boost"],
-                        # weighted_sampler=False,
                         learning_rate=hparams["learning_rate"],  
                         weight_decay=hparams["weight_decay"],  
                         dropout_rate=hparams["dropout_rate"], 
@@ -117,6 +95,8 @@ def main():
                         train_size=n_train,
                         val_size=VAL_NUM,
                         test_size=TEST_NUM,
+                        feature_type=USED_FEATURES,  
+                        ecfp_bits=ECFP_BITS,
                     )
                 except ValueError as e:
                     print(f"Skip n_train={n_train}, seed={seed}: {e}")

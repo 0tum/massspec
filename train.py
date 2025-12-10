@@ -22,6 +22,28 @@ from models import build_model, ModelConfig
 PARQUET_FILE = DEFAULT_PARQUET_FILE 
 BATCH_SIZE = 64
 INTENSITY_POWER = 0.5 
+DEFAULT_FLAG_COLUMNS = [
+    "num_O",
+    "num_N",
+    "num_F",
+    "has_C",
+    "has_O",
+    "has_N",
+    "has_F",
+    "has_H",
+    "has_single",
+    "has_double",
+    "has_triple",
+    "has_aromatic",
+    "has_ring",
+    'has_ether',
+    'has_carbonyl',
+    'has_alcohol',
+    'has_amine',
+    'has_cyano',
+    'has_amide',
+    'has_carboxylic',
+]
 
 # # hparams dict
 hparams_vanilla = {
@@ -30,8 +52,6 @@ hparams_vanilla = {
     "dropout_rate": 0.3544,
     "epochs": 100,
     "patience": 10,
-    "cb_beta": None,
-    "flag_boost": None,
 }
 hparams = hparams_vanilla
 
@@ -48,9 +68,6 @@ RUN_CONFIG = {
     "test_size": 1000,          # 例: 500
 
     # Training mode & loss
-    "train_mode": "vanilla", # "vanilla" or "class_balanced_loss"
-    "cb_beta": hparams["cb_beta"],
-    "flag_boost": hparams["flag_boost"],
     "early_stopping_metric": "val_loss",  # "val_loss", "val_pos_loss"
 
     # Optimization
@@ -69,7 +86,7 @@ RUN_CONFIG = {
 
     # Features
     "feature_type": "ecfp+bert+flag",
-    "structural_flag_columns": None,
+    "structural_flag_columns": DEFAULT_FLAG_COLUMNS,
     "feature_extractor": None,
     "inspect_input": False,
 }
@@ -85,7 +102,7 @@ class MassSpecDataset(Dataset):
         structural_flag_columns: Optional[list] = None,
         feature_extractor: Optional[ChemBERTaFeatureExtractor] = None,
         feature_device: Optional[torch.device] = None,
-        feature_type: str = "ecfp+bert+flag",  # {"ecfp", "ecfp+bert+flag"}
+        feature_type: str = None,  # {"ecfp", "ecfp+bert+flag"}
         ecfp_radius: int = 2,
         ecfp_bits: int = 4096,     #fearure_typeの変更のとき注意
     ):
@@ -94,24 +111,46 @@ class MassSpecDataset(Dataset):
         self.intensity_power = intensity_power
         self.flag_column = flag_column
         self.structural_flag_columns = structural_flag_columns or []
-        valid_feature_types = {"ecfp", "ecfp+bert+flag"}
-        if feature_type not in valid_feature_types:
-            raise ValueError(f"feature_type must be one of {valid_feature_types}, got '{feature_type}'")
+
         self.feature_type = feature_type
-        self.use_bert = feature_type == "ecfp+bert+flag"
-        self.feature_extractor = None
+        self.components = set(feature_type.split('+'))
+
+        self.use_ecfp = "ecfp" in self.components
+        self.use_bert = "bert" in self.components
+        self.use_flag = "flag" in self.components
+
         if self.use_bert:
             self.feature_extractor = feature_extractor or ChemBERTaFeatureExtractor(device=feature_device)
+        else:
+            self.feature_extractor = None
+
+        # 個別特徴の次元を記録する
+        self.component_dims = {}
+
+        if self.use_ecfp:
+            # ECFP用のGeneratorを初期化
+            self.morgan_gen = rdFingerprintGenerator.GetMorganGenerator(
+                radius=ecfp_radius, fpSize=ecfp_bits
+            )
+
+        # valid_feature_types = {"ecfp", "ecfp+bert+flag"}
+        # if feature_type not in valid_feature_types:
+        #     raise ValueError(f"feature_type must be one of {valid_feature_types}, got '{feature_type}'")
+        # self.feature_type = feature_type
+        # self.use_bert = feature_type == "ecfp+bert+flag"
+        # self.feature_extractor = None
+        # if self.use_bert:
+        #     self.feature_extractor = feature_extractor or ChemBERTaFeatureExtractor(device=feature_device)
 
         features_list = []
         mw_list = []
         spectrum_list = []
         flag_list = [] if (flag_column and flag_column in self.df.columns) else None
 
-        # 【追加】Generatorをここで作成（ループの外で作るのが推奨です）
-        self.morgan_gen = rdFingerprintGenerator.GetMorganGenerator(
-            radius=ecfp_radius, fpSize=ecfp_bits
-        )
+        # # 【追加】Generatorをここで作成（ループの外で作るのが推奨です）
+        # self.morgan_gen = rdFingerprintGenerator.GetMorganGenerator(
+        #     radius=ecfp_radius, fpSize=ecfp_bits
+        # )
 
         for _, row in self.df.iterrows():
             mol = Chem.MolFromSmiles(row["smiles"])
@@ -129,31 +168,36 @@ class MassSpecDataset(Dataset):
 
             feature_parts = []
 
+            if self.use_ecfp:
+                # ECFPの計算
+                ecfp_array = self.morgan_gen.GetFingerprintAsNumPy(mol).astype(np.float32)
+                feature_parts.append(ecfp_array)
+                if "ecfp" not in self.component_dims:
+                    self.component_dims["ecfp"] = ecfp_array.shape[0]
+
             if self.use_bert:
-                structural_flags = self._collect_structural_flags(row)
-                hybrid_features = get_hybrid_features(
-                    smiles=canonical_smiles,
-                    flags=structural_flags,
-                    extractor=self.feature_extractor,
-                    device=self.feature_extractor.device,
-                    as_numpy=True,
-                )
-                feature_parts.append(hybrid_features)
+                emb = self.feature_extractor(canonical_smiles, as_numpy=True)
+                feature_parts.append(emb)
+                if "bert" not in self.component_dims:
+                    self.component_dims["bert"] = emb.shape[0]
 
-            # 2. ECFPの計算 (追加)
-            ecfp_array = self.morgan_gen.GetFingerprintAsNumPy(mol).astype(np.float32)
-            feature_parts.append(ecfp_array)
+            if self.use_flag:
+                # 構造フラグが無ければ分類用のフラグ列を1次元で使う
+                s_flags = self._collect_structural_flags(row)
+                if s_flags.size == 0 and self.flag_column and self.flag_column in row:
+                    s_flags = np.asarray([row[self.flag_column]], dtype=np.float32)
+                feature_parts.append(s_flags)
+                if "flag" not in self.component_dims:
+                    self.component_dims["flag"] = len(s_flags)
+            
+            if not feature_parts:
+                raise ValueError("No features selected. At least one of ECFP, BERT, or flags must be used.")
 
-            if len(feature_parts) == 1:
-                final_features = feature_parts[0]
-            else:
-                final_features = np.concatenate(feature_parts, axis=-1)
-
-            # Tensor化してリストに追加
-            features_list.append(torch.tensor(final_features, dtype=torch.float32))
-            mw_list.append(torch.tensor([mw], dtype=torch.float32))
+            # それぞれの特徴を1本のベクトルに連結して蓄積
+            feature_vec = np.concatenate(feature_parts).astype(np.float32)
+            features_list.append(torch.from_numpy(feature_vec))
+            mw_list.append(torch.tensor(mw, dtype=torch.float32))
             spectrum_list.append(torch.from_numpy(spectrum))
-
             if flag_list is not None:
                 flag_list.append(torch.tensor([row[flag_column]], dtype=torch.float32))
 
@@ -207,9 +251,6 @@ def run_training(
     val_ratio: float = 0.10,
     flag_column: str = "has_F",
     structural_flag_columns: Optional[List[str]] = None,
-    train_mode: str = "vanilla",  # "vanilla" | "class_balanced_loss"
-    cb_beta: float = 0.99,
-    flag_boost: float = 1.0,
     weighted_sampler: bool = False,
     compile_model: bool = False,
     pretrained_path: str = None,
@@ -218,12 +259,12 @@ def run_training(
     dropout_rate: Optional[float] = None,
     hidden_units: int = 2000,
     num_hidden_layers: int = 2,
-    ecfp_bits: int = 1024,
-    feature_type: str = "ecfp+bert+flag",  # {"ecfp", "ecfp+bert+flag"}
+    ecfp_bits: int = None,
+    feature_type: str = None,  # {"ecfp", "ecfp+bert+flag"}
     epochs: int = None,
     patience: int = None,
     model_save_path: Optional[str] = "model/mass_spec_model.pth",
-    early_stopping_metric: str = "val_loss",  # "val_loss", "val_pos_loss"
+    early_stopping_metric: str = "val_loss",  
     freeze: bool = False,
     feature_extractor: Optional[ChemBERTaFeatureExtractor] = None,
     inspect_input: bool = False,
@@ -241,12 +282,7 @@ def run_training(
     Returns dict with cosine similarities on the fixed test set.
     """
 
-    if train_mode not in ("vanilla", "class_balanced_loss"):
-        raise ValueError(f"Unsupported train_mode '{train_mode}'. Use 'vanilla' or 'class_balanced_loss'.")
-
     # --- Step 0: load and split data ---
-    cb_beta_val = cb_beta if cb_beta is not None else 0.99
-    flag_boost_val = flag_boost if flag_boost is not None else 1.0
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     train_df, val_df, test_df = split_dataset(
         seed=seed,
@@ -262,25 +298,8 @@ def run_training(
         parquet_file=PARQUET_FILE,
     )
 
-    # クラスバランス重みの計算（train_df上で実施）
-    use_cb_loss = train_mode == "class_balanced_loss"
-    cb_weights = None
     pos_count = int((train_df[flag_column] >= 0.5).sum())
     neg_count = int((train_df[flag_column] < 0.5).sum())
-    if use_cb_loss:
-
-        def _cb_weight(count: int, beta: float) -> float:
-            if count <= 0:
-                return 0.0
-            return (1.0 - beta) / (1.0 - (beta ** count))
-
-        cb_weights = {
-            "pos": _cb_weight(pos_count, cb_beta_val),
-            "neg": _cb_weight(neg_count, cb_beta_val),
-            "pos_count": pos_count,
-            "neg_count": neg_count,
-        }
-        print(f"[CB-Loss] beta={cb_beta_val}, flag_boost={flag_boost_val} | w_pos={cb_weights['pos']:.6f} (n={pos_count}), w_neg={cb_weights['neg']:.6f} (n={neg_count})")
 
     def _count_pos_neg(df_sub: pd.DataFrame, name: str):
         pos = int((df_sub[flag_column] >= 0.5).sum())
@@ -292,7 +311,7 @@ def run_training(
     _count_pos_neg(val_df, "Val (fixed)")
     _count_pos_neg(test_df, "Test (fixed)")
 
-    flag_cols = structural_flag_columns or []
+    flag_cols = structural_flag_columns or DEFAULT_FLAG_COLUMNS
     if feature_type == "ecfp+bert+flag":
         feature_extractor = feature_extractor or ChemBERTaFeatureExtractor()
     else:
@@ -319,6 +338,17 @@ def run_training(
         feature_type=feature_type,
         ecfp_bits=ecfp_bits,
     )
+
+    def _log_feature_info(dataset: MassSpecDataset, name: str):
+        comp_dims = getattr(dataset, "component_dims", {})
+        parts = []
+        for comp in sorted(dataset.components):
+            dim = comp_dims.get(comp, "?")
+            parts.append(f"{comp}:{dim}")
+        total_dim = dataset.features.shape[1]
+        print(f"{name} features -> {' | '.join(parts)} | total_dim={total_dim}")
+
+    _log_feature_info(train_dataset, "Train")
 
     pin_memory = torch.cuda.is_available()
     # WeightedRandomSamplerで各バッチに正例が含まれやすくする（pos/negで同じ確率にする）
@@ -406,7 +436,6 @@ def run_training(
     )
     
     print(f"Initializing model on {config.device} with Intensity Power {INTENSITY_POWER}...")
-    print(f"Selected Training Mode: {train_mode}")
     model = build_model("mlp", config=config)
     model.to(config.device)
 
@@ -473,12 +502,6 @@ def run_training(
     best_metrics_at_best = {}
     
     print("\nStart Training ...")
-    cb_w_pos = cb_w_neg = flag_boost_tensor = None
-    if use_cb_loss and cb_weights is not None:
-        cb_w_pos = torch.tensor(cb_weights["pos"], device=config.device)
-        cb_w_neg = torch.tensor(cb_weights["neg"], device=config.device)
-        flag_boost_tensor = torch.tensor(flag_boost_val, device=config.device)
-    
     for epoch in range(max_epochs):
         model.train()
         train_loss = 0
@@ -487,7 +510,6 @@ def run_training(
             features = batch['features'].to(config.device)
             mw = batch['mw'].to(config.device)
             target = batch['spectrum'].to(config.device)
-            flags = batch['flag'].to(config.device).squeeze(-1)
             
             optimizer.zero_grad()
             
@@ -497,19 +519,7 @@ def run_training(
             
             sims = F.cosine_similarity(prediction, target, dim=1, eps=1e-8)
             losses = 1.0 - sims  # per-sample loss
-
-            if use_cb_loss and cb_w_pos is not None and cb_w_neg is not None:
-                pos_mask = flags >= 0.5
-                class_weights = torch.where(pos_mask, cb_w_pos, cb_w_neg)
-                if flag_boost_val != 1.0:
-                    flag_weights = torch.where(pos_mask, flag_boost_tensor, torch.ones_like(class_weights))
-                    sample_weights = class_weights * flag_weights
-                else:
-                    sample_weights = class_weights
-                weight_sum = torch.clamp(sample_weights.sum(), min=1e-12)
-                loss = (losses * sample_weights).sum() / weight_sum
-            else:
-                loss = losses.mean()
+            loss = losses.mean()
 
             loss.backward()
             optimizer.step()

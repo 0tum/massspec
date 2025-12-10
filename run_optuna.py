@@ -11,11 +11,10 @@ N_POS = 100
 N_NEG = 4900
 SEED = 42
 FLAG_COLUMN = "has_F"
-TRAIN_MODE = "vanilla"  # "vanilla" or "class_balanced_loss"
 
 STORAGE = "sqlite:///output/optuna_study.db"
-STUDY_NAME = "massspec_cb_optuna"
-OUTPUT_CSV = "output/csv/optuna_class-balanced.csv"
+STUDY_NAME = "massspec_optuna"
+OUTPUT_CSV = "output/csv/optuna_vanilla.csv"
 
 
 def objective(trial: optuna.Trial) -> float:
@@ -34,7 +33,6 @@ def objective(trial: optuna.Trial) -> float:
         n_neg=N_NEG,
         seed=SEED,
         flag_column=FLAG_COLUMN,
-        train_mode=TRAIN_MODE,
         weighted_sampler=True,
         compile_model=False,
         pretrained_path=None,
