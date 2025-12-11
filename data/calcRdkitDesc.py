@@ -1,13 +1,12 @@
 """
-Generate BOTH 2D and 3D descriptors with TIMEOUT handling.
-Reads from .npz file (containing 'smiles' array).
+Generate BOTH 2D (Physicochemical) and 3D (Shape/Geometric) descriptors.
+Reads from .npz file (containing 'smiles' array) instead of parquet.
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
-import multiprocessing as mp
 from pathlib import Path
 from typing import Dict, Iterable, Tuple, List
 
@@ -79,118 +78,86 @@ def get_dims() -> Tuple[int, int]:
     return d2, d3
 
 # -------------------------------------------------------------------------
-# Main Processing Logic with TIMEOUT
+# Main Processing Logic
 # -------------------------------------------------------------------------
-def _embed_worker(
-    conn,
+def embed_and_calc(
     smiles: str,
     max_atoms: int,
-    seed: int,
+    params: AllChem.EmbedParameters,
     max_embed_attempts: int,
     dim2: int,
     dim3: int,
-    optimize: bool,
-) -> None:
-    """Child process: heavy RDKit work. Sends result via Pipe."""
+    optimize: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, int, bool, str]:
+    """Returns (desc2d, desc3d, atom_count, success, error_msg)."""
+    
     empty2 = np.zeros(dim2, dtype=np.float32)
     empty3 = np.zeros(dim3, dtype=np.float32)
+
+    # A. Mol Prep
     try:
         mol = Chem.MolFromSmiles(smiles)
-        if mol is None:
-            conn.send((empty2, empty3, 0, False, "Invalid SMILES"))
-            return
-
-        desc2d = calc_2d_descriptors(mol)
-        mol = Chem.AddHs(mol)
+        if mol is None: return empty2, empty3, 0, False, "Invalid SMILES"
+        
+        # 2D計算
+        desc2d = calc_2d_descriptors(mol) 
+        
+        # 水素付加 & 原子数チェック
+        mol = Chem.AddHs(mol) 
         n_atoms = mol.GetNumAtoms()
         if n_atoms > max_atoms:
-            conn.send((desc2d, empty3, n_atoms, False, f"Too large ({n_atoms} > {max_atoms})"))
-            return
+            return desc2d, empty3, n_atoms, False, f"Too large ({n_atoms} > {max_atoms})"
+            
+    except Exception as e:
+        return empty2, empty3, 0, False, f"Prep Error: {e}"
 
-        params = AllChem.ETKDGv3()
-        params.randomSeed = seed
-        params.numThreads = 1
-
-        res = -1
+    # B. 3D Embedding
+    original_seed = params.randomSeed
+    res = -1
+    try:
         for attempt in range(max_embed_attempts):
-            params.randomSeed = seed + attempt
+            params.randomSeed = original_seed + attempt
             res = AllChem.EmbedMolecule(mol, params)
-            if res == 0:
-                break
+            if res == 0: break
             mol.RemoveAllConformers()
+    except Exception as e:
+        return desc2d, empty3, 0, False, f"Embed Error: {e}"
 
-        if res != 0:
-            conn.send((desc2d, empty3, 0, False, "Embed Failed"))
-            return
+    if res != 0:
+        return desc2d, empty3, 0, False, "Embed Failed"
 
-        if optimize:
-            try:
-                AllChem.UFFOptimizeMolecule(mol, maxIters=200)
-            except Exception:
-                pass
+    # C. Optimization
+    if optimize:
+        try: AllChem.UFFOptimizeMolecule(mol, maxIters=200)
+        except: pass
 
+    # D. 3D Calc
+    try:
         desc3d = calc_3d_descriptors(mol)
         if len(desc3d) != dim3:
-            if len(desc3d) < dim3:
-                desc3d = np.pad(desc3d, (0, dim3 - len(desc3d)))
-            else:
-                desc3d = desc3d[:dim3]
-
-        conn.send((desc2d, desc3d, mol.GetNumAtoms(), True, ""))
+            if len(desc3d) < dim3: desc3d = np.pad(desc3d, (0, dim3 - len(desc3d)))
+            else: desc3d = desc3d[:dim3]
+            
+        return desc2d, desc3d, mol.GetNumAtoms(), True, ""
     except Exception as e:
-        conn.send((empty2, empty3, 0, False, f"Worker Error: {e}"))
-    finally:
-        conn.close()
-
-
-def embed_and_calc_timeout(
-    smiles: str,
-    max_atoms: int,
-    seed: int,
-    max_embed_attempts: int,
-    dim2: int,
-    dim3: int,
-    optimize: bool,
-    timeout_sec: int,
-) -> Tuple[np.ndarray, np.ndarray, int, bool, str]:
-    """Run RDKit-heavy work in a child process so timeout forcibly kills it."""
-    parent_conn, child_conn = mp.Pipe(duplex=False)
-    proc = mp.Process(
-        target=_embed_worker,
-        args=(child_conn, smiles, max_atoms, seed, max_embed_attempts, dim2, dim3, optimize),
-    )
-    proc.start()
-    proc.join(timeout=timeout_sec)
-
-    empty2 = np.zeros(dim2, dtype=np.float32)
-    empty3 = np.zeros(dim3, dtype=np.float32)
-
-    if proc.is_alive():
-        proc.kill()
-        proc.join()
-        return empty2, empty3, 0, False, f"TIMEOUT (> {timeout_sec}s)"
-
-    if parent_conn.poll():
-        try:
-            return parent_conn.recv()
-        except EOFError:
-            return empty2, empty3, 0, False, "No result (EOFError)"
-
-    return empty2, empty3, 0, False, "No result (crashed?)"
-
+        return desc2d, empty3, 0, False, f"3D Calc Error: {e}"
 
 def process_smiles(
     smiles_list: Iterable[str],
     max_atoms: int,
     seed: int,
     max_embed_attempts: int,
-    timeout: int,
-    optimize: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, int]:
     
     print("Determining feature dimensions...")
     dim2, dim3 = get_dims()
+    print(f"2D Descriptors: {dim2} dims")
+    print(f"3D Descriptors: {dim3} dims")
     
+    params = AllChem.ETKDGv3()
+    params.randomSeed = seed
+    params.numThreads = 0 
+
     cache: Dict[str, Tuple[np.ndarray, np.ndarray, int, bool]] = {}
 
     n = len(smiles_list)
@@ -199,23 +166,12 @@ def process_smiles(
     atom_counts = np.zeros(n, dtype=np.int32)
     success = np.zeros(n, dtype=bool)
 
-    # tqdmで進捗表示
-    pbar = tqdm(enumerate(smiles_list), total=n, desc="Processing", unit="mol")
-    
-    timeout_count = 0
-    
-    for idx, smi in pbar:
+    for idx, smi in enumerate(tqdm(smiles_list, desc="Processing", unit="mol")):
         if smi in cache:
             d2, d3, count, ok = cache[smi]
         else:
-            d2, d3, count, ok, err = embed_and_calc_timeout(
-                smi, max_atoms, seed, max_embed_attempts, dim2, dim3, optimize, timeout
-            )
+            d2, d3, count, ok, err = embed_and_calc(smi, max_atoms, params, max_embed_attempts, dim2, dim3)
             cache[smi] = (d2, d3, count, ok)
-            
-            if "TIMEOUT" in err:
-                timeout_count += 1
-                pbar.set_postfix({"timeouts": timeout_count, "last_err": err})
 
         arr_2d[idx] = d2
         arr_3d[idx] = d3
@@ -225,14 +181,13 @@ def process_smiles(
     return arr_2d, arr_3d, atom_counts, success, dim2, dim3
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Precompute descriptors with TIMEOUT.")
+    parser = argparse.ArgumentParser(description="Precompute 2D and 3D descriptors from NPZ.")
+    # デフォルトを .npz に変更
     parser.add_argument("--input", default="data/processed/MoNA.npz")
-    parser.add_argument("--output", default="data/processed/MoNA_rdkit_features.npz")
+    parser.add_argument("--output", default="data/processed/MoNA_rdkit-features.npz")
     parser.add_argument("--max-atoms", type=int, default=100)
-    parser.add_argument("--max-embed-attempts", type=int, default=10)
+    parser.add_argument("--max-embed-attempts", type=int, default=10) # 軽くするために回数を減らしています
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--timeout", type=int, default=10, help="Seconds per molecule") # タイムアウト設定
-    parser.add_argument("--no-optimize", action="store_true", help="Skip UFF optimization")
     args = parser.parse_args()
 
     _disable_rdkit_logging()
@@ -242,43 +197,41 @@ def main() -> None:
     
     print(f"Reading {in_path} ...")
     try:
+        # npzからsmilesキーを読み込む
         data = np.load(in_path, allow_pickle=True)
         if 'smiles' not in data:
-             raise ValueError("Key 'smiles' not found.")
+             raise ValueError(f"Key 'smiles' not found in {in_path}. Keys: {list(data.keys())}")
+        
+        # numpy array -> list of strings
         smiles_list = data['smiles'].astype(str).tolist()
         print(f"Loaded {len(smiles_list)} molecules.")
+        
     except Exception as e: 
         print(f"Error loading input: {e}")
         return
 
     # Process
     d2, d3, counts, success, dim2, dim3 = process_smiles(
-        smiles_list, args.max_atoms, args.seed, args.max_embed_attempts, args.timeout, optimize=not args.no_optimize
+        smiles_list, args.max_atoms, args.seed, args.max_embed_attempts
     )
 
-    print(f"Processing Done.")
-    print(f"  - Total: {len(success)}")
-    print(f"  - Success: {success.sum()} ({success.mean()*100:.2f}%)")
-    print(f"  - Failed/Timed out: {len(success) - success.sum()}")
-
+    print(f"3D Success Rate: {success.mean()*100:.2f}%")
+    
     print(f"Saving to {out_path} ...")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     
+    # NPZ保存
     np.savez_compressed(
         out_path,
         smiles=np.array(smiles_list, dtype=object),
         descriptors_2d=d2,
         descriptors_3d=d3,
         atom_counts=counts,
-        success=success, # 学習時はこのフラグがTrueのものだけを使う
+        success=success,
         dim_2d=np.int32(dim2),
         dim_3d=np.int32(dim3),
     )
     print("Done.")
 
 if __name__ == "__main__":
-    try:
-        mp.set_start_method('spawn', force=True)
-    except RuntimeError:
-        pass
     main()

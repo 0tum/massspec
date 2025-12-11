@@ -1,4 +1,4 @@
 mass_spec_model.pth
 __pycache__/*
-data/processed/MoNA.parquet
+data/processed/*
 data/raw/MoNA.sdf

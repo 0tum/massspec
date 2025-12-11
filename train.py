@@ -124,33 +124,20 @@ class MassSpecDataset(Dataset):
         else:
             self.feature_extractor = None
 
-        # 個別特徴の次元を記録する
-        self.component_dims = {}
-
         if self.use_ecfp:
             # ECFP用のGeneratorを初期化
             self.morgan_gen = rdFingerprintGenerator.GetMorganGenerator(
                 radius=ecfp_radius, fpSize=ecfp_bits
             )
-
-        # valid_feature_types = {"ecfp", "ecfp+bert+flag"}
-        # if feature_type not in valid_feature_types:
-        #     raise ValueError(f"feature_type must be one of {valid_feature_types}, got '{feature_type}'")
-        # self.feature_type = feature_type
-        # self.use_bert = feature_type == "ecfp+bert+flag"
-        # self.feature_extractor = None
-        # if self.use_bert:
-        #     self.feature_extractor = feature_extractor or ChemBERTaFeatureExtractor(device=feature_device)
+        
+        # 個別特徴の次元を記録する
+        self.component_dims = {}
 
         features_list = []
         mw_list = []
         spectrum_list = []
         flag_list = [] if (flag_column and flag_column in self.df.columns) else None
 
-        # # 【追加】Generatorをここで作成（ループの外で作るのが推奨です）
-        # self.morgan_gen = rdFingerprintGenerator.GetMorganGenerator(
-        #     radius=ecfp_radius, fpSize=ecfp_bits
-        # )
 
         for _, row in self.df.iterrows():
             mol = Chem.MolFromSmiles(row["smiles"])
