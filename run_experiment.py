@@ -10,14 +10,14 @@ FLAG_COLUMN = "has_F"
 VAL_METRIC = "val_loss"  # {"val_loss", "val_pos_loss"}
 USED_FEATURES = "ecfp+bert+rdkit2d+rdkit3d+flag"  # ecfp, bert, rdkit2d, rdkit3d, flag
 ECFP_BITS = 1024
-SEEDS = [0, 1, 2, 3, 4]
+SEEDS = [0, 1]
 POS_COUNTS = [10, 100, 120]
 TOTAL_SAMPLES = 5000
-OUTPUT_CSV = f"tmp/scaling/scaling-{FLAG_COLUMN}-{USED_FEATURES}_{ECFP_BITS}.csv"
+OUTPUT_CSV = f"tmp/attn_fusion_test1.csv"
 # OUTPUT_FIG = "scaling_error_bars.png"
 
 DOMAIN_SPLIT = False  # Falseならtrain/val/testをドメイン分割で行う
-TRAIN_NUM = [500, 1000, 2000, 5000, 7000]
+TRAIN_NUM = [1000, 2000, 5000, 7000]
 VAL_NUM = 500     # DOMAIN_SPLIT=Falseのときのvalサイズ
 TEST_NUM = 1000   # DOMAIN_SPLIT=Falseのときのtestサイズ
 

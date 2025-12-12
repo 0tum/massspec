@@ -55,6 +55,13 @@ class ModelConfig:
     device: torch.device = field(default_factory=lambda: torch.device("cpu"))
     dtype: torch.dtype = torch.float32
 
+    # --- Attention Fusion用の設定 (追加) ---
+    use_attention_fusion: bool = False
+    fusion_dim: int = 512  # 各特徴量をこの次元に揃える
+    # 各特徴量の次元数マップ (例: {'ecfp': 1024, 'rdkit2d': 200})
+    # ※ dataclassのfieldとして定義するため、初期値は空辞書にする
+    feature_shapes: Dict[str, int] = field(default_factory=dict)
+
 
 # ---------------------------------------------------------------------------
 # Model registry
@@ -344,3 +351,146 @@ class MLPSpectraModel(MassSpectraModel):
         x = self.activation(x)
         return x
 
+# attention fusionの実装
+# 「F分子ならRDKitのスコアを上げる」 という動作を担う核心部分
+class AttentionFusionLayer(nn.Module):
+    def __init__(self, feature_shapes: Dict[str, int], fusion_dim: int = 512):
+        super().__init__()
+        self.feature_shapes = feature_shapes
+        self.fusion_dim = fusion_dim
+        self.feature_names = list(feature_shapes.keys()) # 順序固定のためリスト化
+        self.total_input_dim = sum(feature_shapes.values())
+        if self.total_input_dim <= 0:
+            raise ValueError("AttentionFusionLayer requires at least one feature with positive dimension.")
+
+        # 1. Projectors: 各特徴量を同じ次元(fusion_dim)に変換
+        self.projectors = nn.ModuleDict()
+        for name, input_dim in feature_shapes.items():
+            self.projectors[name] = nn.Sequential(
+                nn.Linear(input_dim, fusion_dim),
+                nn.LayerNorm(fusion_dim),
+                nn.ReLU()
+            )
+
+        # 2. Attention Scorer: 各特徴量の重要度(スカラー)を算出
+        # 入力: fusion_dim -> 出力: 1 (logit)
+        self.attn_fc = nn.Sequential(
+            nn.Linear(fusion_dim, fusion_dim // 2),
+            nn.Tanh(),
+            nn.Linear(fusion_dim // 2, 1) # スカラーを出力
+        )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: 結合された巨大な1次元テンソル [Batch, Total_Dim]
+        Returns:
+            fused_vec: 融合後のベクトル [Batch, fusion_dim]
+            attn_weights: Attentionの重み [Batch, Num_Features] (可視化用)
+        """
+        if x.shape[1] != self.total_input_dim:
+            raise ValueError(
+                f"AttentionFusionLayer expected input dim {self.total_input_dim} "
+                f"from feature_shapes, but got {x.shape[1]}"
+            )
+
+        projected_list = []
+        
+        # 1. 巨大なテンソルを元の特徴量ごとにスライスして射影
+        start_idx = 0
+        for name in self.feature_names:
+            dim = self.feature_shapes[name]
+            # スライス
+            feat_raw = x[:, start_idx : start_idx + dim]
+            start_idx += dim
+            
+            # 射影 (Batch, fusion_dim)
+            proj = self.projectors[name](feat_raw)
+            projected_list.append(proj)
+
+        # スタック -> (Batch, Num_Features, fusion_dim)
+        H = torch.stack(projected_list, dim=1)
+
+        # 2. Attentionスコア計算
+        # (Batch, Num_Features, fusion_dim) -> (Batch, Num_Features, 1)
+        scores = self.attn_fc(H)
+        
+        # Softmaxで確率化 (合計1.0にする)
+        alpha = F.softmax(scores, dim=1) 
+
+        # 3. 重み付け和 (Context Vector)
+        # alpha: (B, N, 1) * H: (B, N, D) -> sum(dim=1) -> (B, D)
+        fused_vec = torch.sum(alpha * H, dim=1)
+        
+        return fused_vec, alpha.squeeze(-1)
+
+@register_model("attention_mlp")
+class AttentionFusionSpectraModel(MassSpectraModel):
+    def __init__(self, config: Optional[ModelConfig] = None) -> None:
+        super().__init__(config=config)
+        cfg = self.config
+
+        # 入力の正規化 (結合された状態で行う)
+        self.input_bn = SafeBatchNorm1d(cfg.fp_length)
+
+        # ★ ここが変更点: Attention Fusion層の初期化
+        if not cfg.feature_shapes:
+            raise ValueError("Attention Fusion requires 'feature_shapes' in config.")
+        
+        self.fusion_layer = AttentionFusionLayer(
+            feature_shapes=cfg.feature_shapes,
+            fusion_dim=cfg.fusion_dim
+        )
+        if self.fusion_layer.total_input_dim != cfg.fp_length:
+            raise ValueError(
+                f"Sum of feature_shapes ({self.fusion_layer.total_input_dim}) must match fp_length ({cfg.fp_length}) for Attention Fusion."
+            )
+
+        # Backboneへの入力次元は fusion_dim になる
+        self.feature_dim = cfg.hidden_units
+        # 最初のLinear層の入力次元を fusion_dim に変更
+        self.backbone_input = nn.Linear(cfg.fusion_dim, cfg.hidden_units)
+
+        # 残りは既存のMLPと同じResidual Blocks
+        self.residual_blocks = nn.ModuleList(
+            ResidualBlock(
+                hidden_units=cfg.hidden_units,
+                dropout_rate=cfg.dropout_rate,
+                activation=self.activation,
+                bottleneck_factor=cfg.resnet_bottleneck_factor,
+            )
+            for _ in range(max(0, cfg.num_hidden_layers))
+        )
+        self.final_bn = SafeBatchNorm1d(cfg.hidden_units)
+        
+        # Heads (既存と同じ)
+        self.forward_head = nn.Linear(cfg.hidden_units, cfg.max_mass_spec_peak_loc)
+        self.backward_head = nn.Linear(cfg.hidden_units, cfg.max_mass_spec_peak_loc)
+        self.gate_head = nn.Linear(cfg.hidden_units, cfg.max_mass_spec_peak_loc)
+        self.output_head = nn.Linear(cfg.hidden_units, cfg.max_mass_spec_peak_loc)
+
+        self.to(self.config.device, self.config.dtype)
+
+    def encode_features(self, fingerprint: torch.Tensor) -> torch.Tensor:
+        x = fingerprint.to(device=self.config.device, dtype=self.config.dtype)
+        
+        # 1. 全体正規化
+        x = self.input_bn(x)
+        
+        # 2. Attention Fusion (ここで分離・結合が行われる)
+        fused_x, attn_weights = self.fusion_layer(x)
+        
+        # ※ attn_weights は解析用に保持したいが、encode_featuresの戻り値定義上
+        # ここではグラフを切った形で最後の重みのみ保持してメモリ圧迫を避ける
+        self.last_attn_weights = attn_weights.detach().cpu()
+
+        # 3. Backbone (MLP)
+        out = self.backbone_input(fused_x)
+        out = self.activation(out)
+        
+        for block in self.residual_blocks:
+            out = block(out)
+        out = self.final_bn(out)
+        out = self.activation(out)
+        
+        return out

@@ -8,11 +8,11 @@ import os  # osモジュールを追加
 FLAG_COLUMN = "has_F"
 VAL_METRIC = "val_loss"
 ECFP_BITS = 1024
-SEEDS = [0, 1, 2, 3, 4]
-DOMAIN_SPLIT = True  # Trueにするとdomain splitモードを使用
+SEEDS = [0, 1]
+DOMAIN_SPLIT = False  # Trueにするとdomain splitモードを使用
 
 # スケーリング用データサイズ (domain_split=False のとき)
-TRAIN_NUM = [500, 1000, 2000, 5000, 7000]
+TRAIN_NUM = [500, 7000]
 VAL_NUM = 500
 TEST_NUM = 1000
 
@@ -21,7 +21,7 @@ POS_COUNTS = [0, 10, 50, 100, 120]
 TOTAL_SAMPLES = 7000
 
 # 結果保存先
-OUTPUT_CSV = f"tmp/scaling/scaling_experiment_results_has_F.csv"
+OUTPUT_CSV = f"tmp/at_fusion_test1.csv"
 OUTPUT_COLUMNS = [
     "split_mode",
     "feature_type",

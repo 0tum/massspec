@@ -462,8 +462,18 @@ def run_training(
             "val_neg_loss": None,
         }
     
-    # --- Model Config ---
+    feature_shapes = train_dataset.component_dims
+    ordered_shapes = {k: feature_shapes[k] for k in train_dataset.component_order}
+    print(f"Feature Shapes for Attention: {ordered_shapes}")
+
+    total_from_shapes = sum(ordered_shapes.values())
     total_input_dim = train_dataset.features.shape[1]
+    if total_from_shapes != total_input_dim:
+        raise ValueError(
+            f"Sum of feature_shapes ({total_from_shapes}) must match concatenated feature dim ({total_input_dim})."
+        )
+    
+    # --- Model Config ---
 
     config = ModelConfig(
         fp_length=total_input_dim,
@@ -477,15 +487,18 @@ def run_training(
         # Configにも記録しておく (models.pyの内部ロジックでは使われないが整合性のため)
         intensity_power=INTENSITY_POWER,
         feature_type=feature_type,
+        feature_shapes=ordered_shapes,
+        fusion_dim=512,
         
         # Loss指定: models.pyのforward出力は ReLU(raw) になる
         # CosineLossを使うならReLUで0以上にクリップされているのは好都合
         loss="normalized_generalized_mse", 
         device=device
     )
+    model_type = 'attention_mlp' # ここでモデルタイプを指定
     
     print(f"Initializing model on {config.device} with Intensity Power {INTENSITY_POWER}...")
-    model = build_model("mlp", config=config)
+    model = build_model(model_type, config=config)
     model.to(config.device)
 
     if pretrained_path:
@@ -494,26 +507,12 @@ def run_training(
         print(f"Loaded pretrained weights from {pretrained_path}")
 
     if freeze:
-        print("Freezing backbone parameters...")
-        freeze_modules = []
-        # ここで指定した名前がモデルに存在するかを確認
-        target_attrs = ["input_layer", "residual_blocks", "final_bn"]
-        
         frozen_count = 0
-        for attr in target_attrs:
-            if hasattr(model, attr):
-                module = getattr(model, attr)
-                freeze_modules.append(module)
-                # 実際にフラグを折る
-                for p in module.parameters():
-                    p.requires_grad = False
-                print(f"  - Frozen layer: {attr}")
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                param.requires_grad = False
                 frozen_count += 1
-            else:
-                print(f"  - Warning: Layer '{attr}' not found in model. Skipped.")
-        
-        if frozen_count == 0:
-            print("  - WARNING: No modules were frozen! Check model attribute names.")
+        print(f"Freezing all parameters: {frozen_count} tensors set to requires_grad=False")
 
     lr = learning_rate if learning_rate is not None else LR
     
@@ -529,7 +528,7 @@ def run_training(
     #     print(f"  - ... and {len(trainable_names)-5} others.")
 
     if len(trainable_params) == 0:
-        raise ValueError("No trainable parameters found. Set freeze=False or unfreeze some layers.")
+        raise ValueError("No trainable parameters found. If you set freeze=True, all layers are frozen; set freeze=False to train.")
     
     # 定数の上書き処理
     lr = learning_rate if learning_rate is not None else LR
