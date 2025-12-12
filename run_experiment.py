@@ -8,8 +8,8 @@ from train import run_training
 # Experiment settings
 FLAG_COLUMN = "has_F"
 VAL_METRIC = "val_loss"  # {"val_loss", "val_pos_loss"}
-USED_FEATURES = "ecfp+bert+flag"  # {"ecfp", "only", "ecfp+bert", "ecfp+bert+flag"}
-ECFP_BITS = 2048
+USED_FEATURES = "ecfp+bert+rdkit2d+rdkit3d+flag"  # ecfp, bert, rdkit2d, rdkit3d, flag
+ECFP_BITS = 1024
 SEEDS = [0, 1, 2, 3, 4]
 POS_COUNTS = [10, 100, 120]
 TOTAL_SAMPLES = 5000

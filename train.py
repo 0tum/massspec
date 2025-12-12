@@ -9,19 +9,19 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from rdkit import Chem
 from rdkit.Chem import Descriptors
-from rdkit.Chem import AllChem # 追加
-from rdkit.Chem import rdFingerprintGenerator # 追加
+from rdkit.Chem import rdFingerprintGenerator
+from sklearn.preprocessing import StandardScaler
+from sklearn.feature_selection import VarianceThreshold
 
-from torch.optim.lr_scheduler import CosineAnnealingLR # 追加
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from data import DEFAULT_PARQUET_FILE, split_dataset
-from features import ChemBERTaFeatureExtractor, get_hybrid_features
+from data import split_dataset
 from models import build_model, ModelConfig
 
 # --- 設定 ---
-PARQUET_FILE = DEFAULT_PARQUET_FILE 
+FEATURES_FILE = "data/processed/MoNA_features.npz"
 BATCH_SIZE = 64
-INTENSITY_POWER = 0.5 
+INTENSITY_POWER = 0.5
 DEFAULT_FLAG_COLUMNS = [
     "num_O",
     "num_N",
@@ -55,6 +55,12 @@ hparams_vanilla = {
 }
 hparams = hparams_vanilla
 
+# Fallback constants (overridden by run-time args)
+LR = hparams["learning_rate"]
+WEIGHT_DECAY = hparams["weight_decay"]
+EPOCHS = hparams["epochs"]
+PATIENCE = hparams["patience"]
+
 # --- Hard-coded run configuration (no CLI needed) ---
 RUN_CONFIG = {
     # Split/seed settings
@@ -85,9 +91,8 @@ RUN_CONFIG = {
     "freeze": False,
 
     # Features
-    "feature_type": "ecfp+bert+flag",
+    "feature_type": "ecfp+bert+rdkit2d+rdkit3d+flag",
     "structural_flag_columns": DEFAULT_FLAG_COLUMNS,
-    "feature_extractor": None,
     "inspect_input": False,
 }
 
@@ -100,11 +105,9 @@ class MassSpecDataset(Dataset):
         intensity_power: float = 0.5,
         flag_column: Optional[str] = None,
         structural_flag_columns: Optional[list] = None,
-        feature_extractor: Optional[ChemBERTaFeatureExtractor] = None,
-        feature_device: Optional[torch.device] = None,
-        feature_type: str = None,  # {"ecfp", "ecfp+bert+flag"}
+        feature_type: str = None,
         ecfp_radius: int = 2,
-        ecfp_bits: int = 4096,     #fearure_typeの変更のとき注意
+        ecfp_bits: int = 4096,
     ):
         self.df = dataframe.reset_index(drop=True)
         self.mode = mode
@@ -112,20 +115,17 @@ class MassSpecDataset(Dataset):
         self.flag_column = flag_column
         self.structural_flag_columns = structural_flag_columns or []
 
-        self.feature_type = feature_type
-        self.components = set(feature_type.split('+'))
+        self.feature_type = feature_type or ""
+        self.component_order = self.feature_type.split('+') if self.feature_type else []
+        self.components = set(self.component_order)
 
         self.use_ecfp = "ecfp" in self.components
         self.use_bert = "bert" in self.components
+        self.use_rdkit2d = "rdkit2d" in self.components
+        self.use_rdkit3d = "rdkit3d" in self.components
         self.use_flag = "flag" in self.components
 
-        if self.use_bert:
-            self.feature_extractor = feature_extractor or ChemBERTaFeatureExtractor(device=feature_device)
-        else:
-            self.feature_extractor = None
-
         if self.use_ecfp:
-            # ECFP用のGeneratorを初期化
             self.morgan_gen = rdFingerprintGenerator.GetMorganGenerator(
                 radius=ecfp_radius, fpSize=ecfp_bits
             )
@@ -142,9 +142,7 @@ class MassSpecDataset(Dataset):
         for _, row in self.df.iterrows():
             mol = Chem.MolFromSmiles(row["smiles"])
             if mol is None:
-                continue # あるいはエラーハンドリング
-            # 【修正】正規化されたSMILESを取得
-            canonical_smiles = Chem.MolToSmiles(mol, isomericSmiles=True)
+                continue
             mw = Descriptors.ExactMolWt(mol)
 
             raw_spectrum = np.array(row["spectrum"], dtype=np.float32)
@@ -155,27 +153,40 @@ class MassSpecDataset(Dataset):
 
             feature_parts = []
 
-            if self.use_ecfp:
-                # ECFPの計算
-                ecfp_array = self.morgan_gen.GetFingerprintAsNumPy(mol).astype(np.float32)
-                feature_parts.append(ecfp_array)
-                if "ecfp" not in self.component_dims:
-                    self.component_dims["ecfp"] = ecfp_array.shape[0]
-
-            if self.use_bert:
-                emb = self.feature_extractor(canonical_smiles, as_numpy=True)
-                feature_parts.append(emb)
-                if "bert" not in self.component_dims:
-                    self.component_dims["bert"] = emb.shape[0]
-
-            if self.use_flag:
-                # 構造フラグが無ければ分類用のフラグ列を1次元で使う
-                s_flags = self._collect_structural_flags(row)
-                if s_flags.size == 0 and self.flag_column and self.flag_column in row:
-                    s_flags = np.asarray([row[self.flag_column]], dtype=np.float32)
-                feature_parts.append(s_flags)
-                if "flag" not in self.component_dims:
-                    self.component_dims["flag"] = len(s_flags)
+            for component in self.component_order:
+                if component == "ecfp":
+                    ecfp_array = self.morgan_gen.GetFingerprintAsNumPy(mol).astype(np.float32)
+                    feature_parts.append(ecfp_array)
+                    if "ecfp" not in self.component_dims:
+                        self.component_dims["ecfp"] = ecfp_array.shape[0]
+                elif component == "bert":
+                    if "bert_features" not in self.df.columns or row["bert_features"] is None:
+                        raise ValueError("BERT features requested but 'bert_features' column is missing or None.")
+                    emb = np.asarray(row["bert_features"], dtype=np.float32)
+                    feature_parts.append(emb)
+                    if "bert" not in self.component_dims:
+                        self.component_dims["bert"] = emb.shape[0]
+                elif component == "rdkit2d":
+                    if "rdkit_2d" not in self.df.columns or row["rdkit_2d"] is None:
+                        raise ValueError("rdkit2d requested but 'rdkit_2d' column is missing or None.")
+                    rdkit2d = np.asarray(row["rdkit_2d"], dtype=np.float32)
+                    feature_parts.append(rdkit2d)
+                    if "rdkit2d" not in self.component_dims:
+                        self.component_dims["rdkit2d"] = rdkit2d.shape[0]
+                elif component == "rdkit3d":
+                    if "rdkit_3d" not in self.df.columns or row["rdkit_3d"] is None:
+                        raise ValueError("rdkit3d requested but 'rdkit_3d' column is missing or None.")
+                    rdkit3d = np.asarray(row["rdkit_3d"], dtype=np.float32)
+                    feature_parts.append(rdkit3d)
+                    if "rdkit3d" not in self.component_dims:
+                        self.component_dims["rdkit3d"] = rdkit3d.shape[0]
+                elif component == "flag":
+                    s_flags = self._collect_structural_flags(row)
+                    if s_flags.size == 0 and self.flag_column and self.flag_column in row:
+                        s_flags = np.asarray([row[self.flag_column]], dtype=np.float32)
+                    feature_parts.append(s_flags)
+                    if "flag" not in self.component_dims:
+                        self.component_dims["flag"] = len(s_flags)
             
             if not feature_parts:
                 raise ValueError("No features selected. At least one of ECFP, BERT, or flags must be used.")
@@ -217,6 +228,58 @@ class MassSpecDataset(Dataset):
         if self.flags is not None:
             item['flag'] = self.flags[idx]
         return item
+
+
+def apply_feature_scaling(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    feature_cols: List[str],
+):
+    """Fit VarianceThreshold and StandardScaler on train_df only and transform all splits."""
+    train_df = train_df.copy()
+    val_df = val_df.copy()
+    test_df = test_df.copy()
+
+    for col in feature_cols:
+        if col not in train_df.columns:
+            print(f"[Scaling] Column '{col}' not found in train_df; skipping.")
+            continue
+        if len(train_df) == 0:
+            print(f"[Scaling] Train split empty; skipping scaling for '{col}'.")
+            continue
+
+        train_matrix = np.stack([np.asarray(x, dtype=np.float32) for x in train_df[col]])
+        vt = VarianceThreshold(threshold=0.0)
+        train_reduced = vt.fit_transform(train_matrix)
+
+        if train_reduced.shape[1] == 0:
+            print(f"[Scaling] All features removed for '{col}' after variance thresholding.")
+            empty_train = [np.empty(0, dtype=np.float32) for _ in range(len(train_df))]
+            train_df[col] = empty_train
+            if col in val_df.columns and len(val_df) > 0:
+                val_df[col] = [np.empty(0, dtype=np.float32) for _ in range(len(val_df))]
+            if col in test_df.columns and len(test_df) > 0:
+                test_df[col] = [np.empty(0, dtype=np.float32) for _ in range(len(test_df))]
+            continue
+
+        scaler = StandardScaler()
+        train_scaled = scaler.fit_transform(train_reduced)
+        train_df[col] = [row.astype(np.float32) for row in train_scaled]
+
+        def _transform_df(df: pd.DataFrame) -> pd.DataFrame:
+            if col not in df.columns or len(df) == 0:
+                return df
+            matrix = np.stack([np.asarray(x, dtype=np.float32) for x in df[col]])
+            reduced = vt.transform(matrix)
+            scaled = scaler.transform(reduced)
+            df[col] = [row.astype(np.float32) for row in scaled]
+            return df
+
+        val_df = _transform_df(val_df)
+        test_df = _transform_df(test_df)
+
+    return train_df, val_df, test_df
     
 # --- 2. 損失関数 (Cosine Loss) ---
 class CosineLoss(nn.Module):
@@ -247,13 +310,12 @@ def run_training(
     hidden_units: int = 2000,
     num_hidden_layers: int = 2,
     ecfp_bits: int = None,
-    feature_type: str = None,  # {"ecfp", "ecfp+bert+flag"}
+    feature_type: str = None,  # e.g., "ecfp+bert+rdkit2d+rdkit3d+flag"
     epochs: int = None,
     patience: int = None,
     model_save_path: Optional[str] = "model/mass_spec_model.pth",
     early_stopping_metric: str = "val_loss",  
     freeze: bool = False,
-    feature_extractor: Optional[ChemBERTaFeatureExtractor] = None,
     inspect_input: bool = False,
     domain_split: bool = False,
     train_size: Optional[int] = 7000,
@@ -282,7 +344,7 @@ def run_training(
         test_size=test_size,
         val_ratio=val_ratio,
         test_ratio=test_ratio,
-        parquet_file=PARQUET_FILE,
+        data_file=FEATURES_FILE,
     )
 
     pos_count = int((train_df[flag_column] >= 0.5).sum())
@@ -299,10 +361,21 @@ def run_training(
     _count_pos_neg(test_df, "Test (fixed)")
 
     flag_cols = structural_flag_columns or DEFAULT_FLAG_COLUMNS
-    if feature_type == "ecfp+bert+flag":
-        feature_extractor = feature_extractor or ChemBERTaFeatureExtractor()
-    else:
-        feature_extractor = None
+
+    component_order = feature_type.split('+') if feature_type else []
+    scaling_cols = []
+    if "rdkit2d" in component_order:
+        scaling_cols.append("rdkit_2d")
+    if "rdkit3d" in component_order:
+        scaling_cols.append("rdkit_3d")
+
+    if scaling_cols:
+        train_df, val_df, test_df = apply_feature_scaling(
+            train_df=train_df,
+            val_df=val_df,
+            test_df=test_df,
+            feature_cols=scaling_cols,
+        )
     
     # Datasetに intensity_power を渡す
     train_dataset = MassSpecDataset(
@@ -311,7 +384,6 @@ def run_training(
         intensity_power=INTENSITY_POWER,
         flag_column=flag_column,
         structural_flag_columns=flag_cols,
-        feature_extractor=feature_extractor,
         feature_type=feature_type,
         ecfp_bits=ecfp_bits,
     )
@@ -321,7 +393,6 @@ def run_training(
         intensity_power=INTENSITY_POWER,
         flag_column=flag_column,
         structural_flag_columns=flag_cols,
-        feature_extractor=feature_extractor,
         feature_type=feature_type,
         ecfp_bits=ecfp_bits,
     )
@@ -329,7 +400,7 @@ def run_training(
     def _log_feature_info(dataset: MassSpecDataset, name: str):
         comp_dims = getattr(dataset, "component_dims", {})
         parts = []
-        for comp in sorted(dataset.components):
+        for comp in dataset.component_order:
             dim = comp_dims.get(comp, "?")
             parts.append(f"{comp}:{dim}")
         total_dim = dataset.features.shape[1]
@@ -365,27 +436,18 @@ def run_training(
         batch = next(iter(train_loader))
         features = batch["features"]
         print("# 入力の分布を確認")
-        if feature_type == "ecfp+bert+flag":
-            bert_dim = 768
-            bert_part = features[:, :bert_dim]
-            remaining = features[:, bert_dim:]
-            flag_dim = max(0, remaining.shape[1] - ecfp_bits)
-            flag_part = remaining[:, :flag_dim] if flag_dim > 0 else None
-            ecfp_part = remaining[:, flag_dim:]
-
-            print(f"BERT Mean: {bert_part.mean():.4f}, Std: {bert_part.std():.4f}")
-            print(f"BERT Min:  {bert_part.min():.4f},  Max: {bert_part.max():.4f}")
-            print("-" * 30)
-            if flag_part is not None and flag_part.numel() > 0:
-                print(f"Flag Mean: {flag_part.mean():.4f}, Std: {flag_part.std():.4f}")
-                print(f"Flag Min:  {flag_part.min():.4f},  Max: {flag_part.max():.4f}")
-                print("-" * 30)
-            print(f"ECFP Mean: {ecfp_part.mean():.4f}, Std: {ecfp_part.std():.4f}")
-            print(f"ECFP Min:  {ecfp_part.min():.4f},  Max: {ecfp_part.max():.4f}")
-        else:
-            ecfp_part = features
-            print(f"ECFP Mean: {ecfp_part.mean():.4f}, Std: {ecfp_part.std():.4f}")
-            print(f"ECFP Min:  {ecfp_part.min():.4f},  Max: {ecfp_part.max():.4f}")
+        start = 0
+        for comp in train_dataset.component_order:
+            dim = train_dataset.component_dims.get(comp, 0)
+            if dim <= 0:
+                continue
+            end = start + dim
+            part = features[:, start:end]
+            print(
+                f"{comp} Mean: {part.mean():.4f}, Std: {part.std():.4f}, "
+                f"Min: {part.min():.4f}, Max: {part.max():.4f}"
+            )
+            start = end
 
         return {
             "overall": None,
@@ -477,8 +539,6 @@ def run_training(
     max_epochs = epochs if epochs is not None else EPOCHS
 
     optimizer = optim.Adam(trainable_params, lr=lr, weight_decay=wd)
-    
-    # ... (後略)
     scheduler = CosineAnnealingLR(optimizer, T_max=max_epochs, eta_min=1e-6) # 追加
     
     history = {'train_loss': [], 'val_loss': [], 'val_pos_loss': [], 'val_neg_loss': []}
@@ -618,7 +678,6 @@ def run_training(
             intensity_power=INTENSITY_POWER,
             flag_column=flag_column,
             structural_flag_columns=flag_cols,
-            feature_extractor=feature_extractor,
             feature_type=feature_type,
             ecfp_bits=ecfp_bits,
         )
