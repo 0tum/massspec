@@ -311,6 +311,7 @@ def run_training(
     num_hidden_layers: int = 2,
     ecfp_bits: int = None,
     feature_type: str = None,  # e.g., "ecfp+bert+rdkit2d+rdkit3d+flag"
+    model_type: str = "mlp",
     epochs: int = None,
     patience: int = None,
     model_save_path: Optional[str] = "model/mass_spec_model.pth",
@@ -495,9 +496,8 @@ def run_training(
         loss="normalized_generalized_mse", 
         device=device
     )
-    model_type = 'attention_mlp' # ここでモデルタイプを指定
-    
-    print(f"Initializing model on {config.device} with Intensity Power {INTENSITY_POWER}...")
+
+    print(f"Initializing model on {config.device} with Intensity Power {INTENSITY_POWER} (model={model_type})...")
     model = build_model(model_type, config=config)
     model.to(config.device)
 

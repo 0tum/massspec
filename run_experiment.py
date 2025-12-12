@@ -6,6 +6,7 @@ from train import run_training
 
 
 # Experiment settings
+MODEL_TYPE = "attention_mlp"  # "mlp" or "attention_mlp"
 FLAG_COLUMN = "has_F"
 VAL_METRIC = "val_loss"  # {"val_loss", "val_pos_loss"}
 USED_FEATURES = "ecfp+bert+rdkit2d+rdkit3d+flag"  # ecfp, bert, rdkit2d, rdkit3d, flag
@@ -59,6 +60,7 @@ def main():
                         domain_split=True,
                         feature_type=USED_FEATURES,  
                         ecfp_bits=ECFP_BITS,
+                        model_type=MODEL_TYPE,
                         )
                 except ValueError as e:
                     # 例: プールに十分なデータがない場合
@@ -74,6 +76,7 @@ def main():
                         "neg_acc": res.get("neg"),
                         "overall_acc": res.get("overall"),
                         "best_epoch": res.get("best_epoch"),
+                        "model_type": MODEL_TYPE,
                     }
                 )
     else:
@@ -97,6 +100,7 @@ def main():
                         test_size=TEST_NUM,
                         feature_type=USED_FEATURES,  
                         ecfp_bits=ECFP_BITS,
+                        model_type=MODEL_TYPE,
                     )
                 except ValueError as e:
                     print(f"Skip n_train={n_train}, seed={seed}: {e}")
@@ -112,6 +116,7 @@ def main():
                         "neg_acc": res.get("neg"),
                         "overall_acc": res.get("overall"),
                         "best_epoch": res.get("best_epoch"),
+                        "model_type": MODEL_TYPE,
                     }
                 )
 
