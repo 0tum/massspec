@@ -1,5 +1,5 @@
-mass_spec_model.pth
 __pycache__/*
 data/processed/*
 data/raw/MoNA.sdf
 data/__pycache__/*
+model/*.pth

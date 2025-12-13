@@ -11,13 +11,14 @@ FLAG_COLUMN = "has_F"
 VAL_METRIC = "val_loss"  # {"val_loss", "val_pos_loss"}
 USED_FEATURES = "ecfp+bert+rdkit2d+rdkit3d+flag"  # ecfp, bert, rdkit2d, rdkit3d, flag
 ECFP_BITS = 1024
-SEEDS = [1]
-POS_COUNTS = [10, 100, 120]
-TOTAL_SAMPLES = 5000
-OUTPUT_CSV = f"tmp/attn_fusion_test1.csv"
+SEEDS = [0, 1, 2, 3, 4]
+POS_COUNTS = [0, 1, 2, 5, 10, 20, 50, 100, 120, 170]
+TOTAL_SAMPLES = 7000
+OUTPUT_CSV = f"tmp/attention_fusion/1213-1553.csv"
 # OUTPUT_FIG = "scaling_error_bars.png"
+# MODEL_SAVE_PATH = "model/attn_fusion_model_donotuse.pth"
 
-DOMAIN_SPLIT = False  # Falseならtrain/val/testをドメイン分割で行う
+DOMAIN_SPLIT = True  # Falseならtrain/val/testをドメイン分割で行う
 TRAIN_NUM = [7000]
 VAL_NUM = 500     # DOMAIN_SPLIT=Falseのときのvalサイズ
 TEST_NUM = 1000   # DOMAIN_SPLIT=Falseのときのtestサイズ
@@ -39,6 +40,7 @@ def main():
     records = []
     if DOMAIN_SPLIT:
         for n_pos in tqdm(POS_COUNTS, desc="n_pos sweep"):
+            MODEL_SAVE_PATH = f"model/attn_fusion_model_f{n_pos}_3features.pth"
             n_neg = TOTAL_SAMPLES - n_pos
             if n_neg <= 0:
                 print(f"Skip n_pos={n_pos}: TOTAL_SAMPLES={TOTAL_SAMPLES} not enough for neg")
@@ -61,6 +63,7 @@ def main():
                         feature_type=USED_FEATURES,  
                         ecfp_bits=ECFP_BITS,
                         model_type=MODEL_TYPE,
+                        model_save_path=MODEL_SAVE_PATH,
                         )
                 except ValueError as e:
                     # 例: プールに十分なデータがない場合

@@ -1,2 +1,0 @@
-n_train,n_val,n_test,seed,pos_acc,neg_acc,overall_acc,best_epoch,model_type
-7000,500,1000,1,0.6805225426242465,0.6665120724421204,0.6668062912020832,7,attention_mlp

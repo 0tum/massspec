@@ -8,8 +8,8 @@ import os  # osモジュールを追加
 FLAG_COLUMN = "has_F"
 VAL_METRIC = "val_loss"
 ECFP_BITS = 1024
-SEEDS = [0, 1]
-DOMAIN_SPLIT = False  # Trueにするとdomain splitモードを使用
+SEEDS = [0]
+DOMAIN_SPLIT = True  # Trueにするとdomain splitモードを使用
 
 # スケーリング用データサイズ (domain_split=False のとき)
 TRAIN_NUM = [500, 7000]
@@ -17,11 +17,11 @@ VAL_NUM = 500
 TEST_NUM = 1000
 
 # domain_split=Trueのときの設定
-POS_COUNTS = [0, 10, 50, 100, 120]
+POS_COUNTS = [0, 1, 2, 5, 10, 20, 50, 100, 120, 170]
 TOTAL_SAMPLES = 7000
 
 # 結果保存先
-OUTPUT_CSV = f"tmp/at_fusion_test1.csv"
+OUTPUT_CSV = f"tmp/attn_fusion_scaling_has-F_3features.csv"
 OUTPUT_COLUMNS = [
     "split_mode",
     "feature_type",
@@ -51,12 +51,21 @@ hparams = hparams_vanilla
 ALL_FEATURES = ["ecfp", "rdkit2d", "rdkit3d", "bert", "flag"]
 
 # 組み合わせの自動生成
-experiments = []
-for r in range(1, len(ALL_FEATURES) + 1):
-    for combo in itertools.combinations(ALL_FEATURES, r):
-        experiments.append(list(combo))
+# experiments = []
+# for r in range(1, len(ALL_FEATURES) + 1):
+#     for combo in itertools.combinations(ALL_FEATURES, r):
+#         experiments.append(list(combo))
 
-print(f"Total experiment configurations: {len(experiments)}")
+# print(f"Total experiment configurations: {len(experiments)}")
+
+experiments =[
+    # "ecfp+bert+flag",
+    # "ecfp+rdkit2d+flag",
+    # "ecfp+rdkit2d+rdkit3d",
+    # "ecfp+rdkit2d+flag+bert",
+    # "ecfp+rdkit2d+rdkit3d+bert+flag"
+    'ecfp+bert+rdkit2d'
+]
 
 
 def _append_record(record: dict):
@@ -71,7 +80,8 @@ def _append_record(record: dict):
 def experiment_random_split():
     """domain_split=Falseでtrain/val/testサイズを指定して回す実験。"""
     for exp_features in experiments:
-        used_features_str = "+".join(exp_features)
+        # used_features_str = "+".join(exp_features)
+        used_features_str = exp_features
         print(f"Running experiment (random split): {used_features_str}")
         
         for n_train in tqdm(TRAIN_NUM, desc="train size sweep"):
@@ -120,7 +130,8 @@ def experiment_random_split():
 def experiment_domain_split():
     """domain_split=Trueで、POS_COUNTS/TOTAL_SAMPLESを使って回す実験。"""
     for exp_features in experiments:
-        used_features_str = "+".join(exp_features)
+        # used_features_str = "+".join(exp_features)
+        used_features_str = exp_features
         print(f"Running experiment (domain split): {used_features_str}")
 
         for n_pos in tqdm(POS_COUNTS, desc="n_pos sweep"):
@@ -148,6 +159,7 @@ def experiment_domain_split():
                         test_size=None,
                         feature_type=used_features_str,
                         ecfp_bits=ECFP_BITS,
+                        model_type="attention_mlp",
                     )
                 except ValueError as e:
                     print(f"Skipped {used_features_str}, n_pos={n_pos}, seed={seed}: {e}")
